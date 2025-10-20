@@ -11,7 +11,7 @@ from scvi import REGISTRY_KEYS
 from scvi.data import AnnDataManager
 from scvi.data.fields import LayerField, NumericalObsField
 from scvi.model.base import BaseModelClass, UnsupervisedTrainingMixin
-from src import MRDeconv
+from src.modules.mrdeconv import MRDeconv
 from scvi.utils import setup_anndata_dsp
 from scvi.utils._docstrings import devices_dsp
 
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
     from anndata import AnnData
 
-    from src import CondSCVI
+    from src.models.condscvi import CondSCVI
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,7 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
         **module_kwargs,
     ):
         super().__init__(st_adata)
+        # 实例化MRDeconv模块
         self.module = self._module_cls(
             n_spots=st_adata.n_obs,
             n_labels=cell_type_mapping.shape[0],
@@ -118,7 +119,7 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
         **module_kwargs,
     ):
         """Alternate constructor for exploiting a pre-trained model on a RNA-seq dataset.
-
+        从预训练的CondSCVI模型中提取参数，初始化DestVI模型。
         Parameters
         ----------
         st_adata

@@ -15,7 +15,7 @@ from scvi.model.base import (
     UnsupervisedTrainingMixin,
     VAEMixin,
 )
-from scvi.module import VAEC
+from src.modules.vaec import VAEC
 from scvi.utils import setup_anndata_dsp
 from scvi.utils._docstrings import devices_dsp
 

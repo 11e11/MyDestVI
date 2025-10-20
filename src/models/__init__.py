@@ -1,3 +1,4 @@
-from .destvi import DestVI
+# from .destvi import DestVI
+# from .condscvi import CondSCVI  # 如果有 condscvi.py
 
-__all__ = ["DestVI",'CondSCVI']  # add CondSCVI to __all__
+# __all__ = ["DestVI", "CondSCVI"]
