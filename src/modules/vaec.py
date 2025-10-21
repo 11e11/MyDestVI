@@ -158,11 +158,25 @@ class VAEC(BaseModuleClass):
         if self.log_variational:
             x_ = torch.log1p(x_)
 
+        # 检查输入
+        if torch.isnan(x_).any():
+            print("nan detected in x_ (input to encoder)!")
+        if torch.isnan(y).any():
+            print("nan detected in y (input to encoder)!")
+
         encoder_input = [x_, y]
         if batch_index is not None and self.encode_covariates:
             encoder_input.append(batch_index)
 
         qz, z = self.z_encoder(*encoder_input)
+
+        # 检查encoder输出
+        if hasattr(qz, "loc") and torch.isnan(qz.loc).any():
+            print("nan detected in qz.loc!")
+        if hasattr(qz, "scale") and torch.isnan(qz.scale).any():
+            print("nan detected in qz.scale!")
+        if torch.isnan(z).any():
+            print("nan detected in z!")
 
         if n_samples > 1:
             untran_z = qz.sample((n_samples,))

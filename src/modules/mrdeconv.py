@@ -9,6 +9,7 @@ from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import FCLayers
+from torch.distributions import Normal, Dirichlet
 
 if TYPE_CHECKING:
     from collections import OrderedDict
@@ -75,6 +76,7 @@ class MRDeconv(BaseModuleClass):
         Extra keyword arguments passed into :class:`~scvi.nn.FCLayers`.
     """
 
+    
     def __init__(
         self,
         n_spots: int,
@@ -95,6 +97,10 @@ class MRDeconv(BaseModuleClass):
         l1_reg: float = 0.0,
         beta_reg: float = 5.0,
         eta_reg: float = 1e-4,
+
+        dirichlet_alpha: float | list | None = None,
+        dirichlet_mmd_reg: float = 0.0,
+
         extra_encoder_kwargs: dict | None = None,
         extra_decoder_kwargs: dict | None = None,
     ):
@@ -184,6 +190,42 @@ class MRDeconv(BaseModuleClass):
             ),
             torch.nn.Linear(n_hidden, n_labels + 1),
         )
+
+        if dirichlet_alpha is None:
+            alpha = torch.ones(self.n_labels)  # length = n_labels (exclude dummy)
+        else:
+            alpha = torch.tensor(dirichlet_alpha, dtype=torch.float32)
+            if alpha.numel() == 1:
+               alpha = alpha.repeat(self.n_labels)
+            elif alpha.numel() != self.n_labels:
+                raise ValueError("dirichlet_alpha must be scalar or length n_labels (exclude dummy)")
+        self.register_buffer("dirichlet_alpha", alpha)
+        self.dirichlet_mmd_reg = float(dirichlet_mmd_reg)
+
+
+    def _pairwise_sq_dists(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        a_norm = (a ** 2).sum(dim=1).unsqueeze(1)
+        b_norm = (b ** 2).sum(dim=1).unsqueeze(0)
+        return a_norm + b_norm - 2.0 * a @ b.t()
+
+    def _mmd_rbf(self, x: torch.Tensor, y: torch.Tensor, sigma: float | None = None) -> torch.Tensor:
+        n = x.size(0)
+        m = y.size(0)
+        if n <= 1 or m <= 1:
+            return torch.tensor(0.0, device=x.device)
+        if sigma is None:
+            comb = torch.cat([x, y], dim=0)
+            d2 = self._pairwise_sq_dists(comb, comb)
+            d2_flat = d2.view(-1)
+            d2_pos = d2_flat[d2_flat > 0]
+            sigma = (torch.sqrt(d2_pos.median()) + 1e-8).item() if d2_pos.numel() > 0 else 1.0
+        Kxx = torch.exp(-self._pairwise_sq_dists(x, x) / (2.0 * sigma * sigma))
+        Kyy = torch.exp(-self._pairwise_sq_dists(y, y) / (2.0 * sigma * sigma))
+        Kxy = torch.exp(-self._pairwise_sq_dists(x, y) / (2.0 * sigma * sigma))
+        sum_Kxx = (Kxx.sum() - Kxx.diag().sum()) / (n * (n - 1))
+        sum_Kyy = (Kyy.sum() - Kyy.diag().sum()) / (m * (m - 1))
+        sum_Kxy = Kxy.sum() / (n * m)
+        return sum_Kxx + sum_Kyy - 2.0 * sum_Kxy
 
     def _get_inference_input(self, tensors):
         # we perform MAP here, so we just need to subsample the variables
@@ -313,18 +355,33 @@ class MRDeconv(BaseModuleClass):
             neg_log_likelihood_prior = -log_likelihood_prior.sum(1)  # minibatch
             # mean_vprior is of shape n_labels, p, n_latent
 
+
+        # ---- Dirichlet MMD on real labels only (exclude dummy at last column) ----
+        mmd_term = torch.tensor(0.0, device=px_rate.device)
+        if getattr(self, "dirichlet_mmd_reg", 0.0) > 0.0:
+            # v: (batch_size, n_labels + 1)  -> take first n_labels columns
+            v_real = v[:, : self.n_labels]  # ignore dummy
+            proportions = v_real / (v_real.sum(dim=1, keepdim=True) + 1e-8)
+            alpha = self.dirichlet_alpha.to(proportions.device)
+            dirich = Dirichlet(alpha)
+            theta_prior = dirich.sample((proportions.size(0),)).to(proportions.device)
+            mmd_term = self._mmd_rbf(proportions, theta_prior)
+
         # High v_sparsity_loss is detrimental early in training, scaling by kl_weight to increase
         # over training epochs.
-        loss = n_obs * (
-            torch.mean(reconst_loss + kl_weight * (neg_log_likelihood_prior + v_sparsity_loss))
-            + glo_neg_log_likelihood_prior
-        )
+        # loss = n_obs * (
+        #     torch.mean(reconst_loss + kl_weight * (neg_log_likelihood_prior + v_sparsity_loss))
+        #     + glo_neg_log_likelihood_prior
+        # )
+        sample_term = reconst_loss + kl_weight * (neg_log_likelihood_prior + v_sparsity_loss)
+        loss = n_obs * (torch.mean(sample_term) + glo_neg_log_likelihood_prior + self.dirichlet_mmd_reg * mmd_term)
 
         return LossOutput(
             loss=loss,
             reconstruction_loss=reconst_loss,
             kl_local=neg_log_likelihood_prior,
             kl_global=glo_neg_log_likelihood_prior,
+            extra_metrics={"mmd": mmd_term}
         )
 
     @torch.inference_mode()

@@ -87,6 +87,10 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
         n_layers: int,
         dropout_decoder: float,
         l1_reg: float,
+
+        dirichlet_alpha: float | list | None = None,
+        dirichlet_mmd_reg: float = 0.0,
+
         **module_kwargs,
     ):
         super().__init__(st_adata)
@@ -103,6 +107,10 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
             n_hidden=n_hidden,
             dropout_decoder=dropout_decoder,
             l1_reg=l1_reg,
+
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_mmd_reg=dirichlet_mmd_reg,
+
             **module_kwargs,
         )
         self.cell_type_mapping = cell_type_mapping
