@@ -9,7 +9,7 @@ import torch
 
 from scvi import REGISTRY_KEYS
 from scvi.data import AnnDataManager
-from scvi.data.fields import LayerField, NumericalObsField
+from scvi.data.fields import LayerField, NumericalObsField, ObsmField
 from scvi.model.base import BaseModelClass, UnsupervisedTrainingMixin
 from src.modules.mrdeconv import MRDeconv
 from scvi.utils import setup_anndata_dsp
@@ -91,6 +91,9 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
         dirichlet_alpha: float | list | None = None,
         dirichlet_mmd_reg: float = 0.0,
 
+        contrastive_reg: float = 1.0,
+        contrastive_margin: float = 0.5,
+
         **module_kwargs,
     ):
         super().__init__(st_adata)
@@ -110,6 +113,9 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
 
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_mmd_reg=dirichlet_mmd_reg,
+
+            contrastive_reg=contrastive_reg,
+            contrastive_margin=contrastive_margin,
 
             **module_kwargs,
         )
@@ -325,96 +331,198 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
             index_names = index_names[indices]
         return pd.DataFrame(data=data, columns=column_names, index=index_names)
 
-    @devices_dsp.dedent
-    def train(
-        self,
-        max_epochs: int = 2000,
-        lr: float = 0.003,
-        accelerator: str = "auto",
-        devices: int | list[int] | str = "auto",
-        train_size: float = 1.0,
-        validation_size: float | None = None,
-        shuffle_set_split: bool = True,
-        batch_size: int = 128,
-        n_epochs_kl_warmup: int = 200,
-        datasplitter_kwargs: dict | None = None,
-        plan_kwargs: dict | None = None,
-        **kwargs,
-    ):
-        """Trains the model using MAP inference.
+    # @devices_dsp.dedent
+    # def train(
+    #     self,
+    #     max_epochs: int = 2000,
+    #     lr: float = 0.003,
+    #     accelerator: str = "auto",
+    #     devices: int | list[int] | str = "auto",
+    #     train_size: float = 1.0,
+    #     validation_size: float | None = None,
+    #     shuffle_set_split: bool = True,
+    #     batch_size: int = 128,
+    #     n_epochs_kl_warmup: int = 200,
+    #     datasplitter_kwargs: dict | None = None,
+    #     plan_kwargs: dict | None = None,
+    #     **kwargs,
+    # ):
+    #     """Trains the model using MAP inference.
 
-        Parameters
-        ----------
-        max_epochs
-            Number of epochs to train for
-        lr
-            Learning rate for optimization.
-        %(param_accelerator)s
-        %(param_devices)s
-        train_size
-            Size of training set in the range [0.0, 1.0].
-        validation_size
-            Size of the test set. If `None`, defaults to 1 - `train_size`. If
-            `train_size + validation_size < 1`, the remaining cells belong to a test set.
-        shuffle_set_split
-            Whether to shuffle indices before splitting. If `False`, the val, train, and test set
-            are split in the sequential order of the data according to `validation_size` and
-            `train_size` percentages.
-        batch_size
-            Minibatch size to use during training.
-        n_epochs_kl_warmup
-            number of epochs needed to reach unit kl weight in the elbo
-        datasplitter_kwargs
-            Additional keyword arguments passed into :class:`~scvi.dataloaders.DataSplitter`.
-        plan_kwargs
-            Keyword args for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to
-            `train()` will overwrite values present in `plan_kwargs`, when appropriate.
-        **kwargs
-            Other keyword args for :class:`~scvi.train.Trainer`.
-        """
-        update_dict = {
-            "lr": lr,
-            "n_epochs_kl_warmup": n_epochs_kl_warmup,
-        }
-        if plan_kwargs is not None:
-            plan_kwargs.update(update_dict)
+    #     Parameters
+    #     ----------
+    #     max_epochs
+    #         Number of epochs to train for
+    #     lr
+    #         Learning rate for optimization.
+    #     %(param_accelerator)s
+    #     %(param_devices)s
+    #     train_size
+    #         Size of training set in the range [0.0, 1.0].
+    #     validation_size
+    #         Size of the test set. If `None`, defaults to 1 - `train_size`. If
+    #         `train_size + validation_size < 1`, the remaining cells belong to a test set.
+    #     shuffle_set_split
+    #         Whether to shuffle indices before splitting. If `False`, the val, train, and test set
+    #         are split in the sequential order of the data according to `validation_size` and
+    #         `train_size` percentages.
+    #     batch_size
+    #         Minibatch size to use during training.
+    #     n_epochs_kl_warmup
+    #         number of epochs needed to reach unit kl weight in the elbo
+    #     datasplitter_kwargs
+    #         Additional keyword arguments passed into :class:`~scvi.dataloaders.DataSplitter`.
+    #     plan_kwargs
+    #         Keyword args for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to
+    #         `train()` will overwrite values present in `plan_kwargs`, when appropriate.
+    #     **kwargs
+    #         Other keyword args for :class:`~scvi.train.Trainer`.
+    #     """
+    #     update_dict = {
+    #         "lr": lr,
+    #         "n_epochs_kl_warmup": n_epochs_kl_warmup,
+    #     }
+    #     if plan_kwargs is not None:
+    #         plan_kwargs.update(update_dict)
+    #     else:
+    #         plan_kwargs = update_dict
+    #     super().train(
+    #         max_epochs=max_epochs,
+    #         accelerator=accelerator,
+    #         devices=devices,
+    #         train_size=train_size,
+    #         validation_size=validation_size,
+    #         shuffle_set_split=shuffle_set_split,
+    #         batch_size=batch_size,
+    #         datasplitter_kwargs=datasplitter_kwargs,
+    #         plan_kwargs=plan_kwargs,
+    #         **kwargs,
+    #     )
+
+    def train(self, max_epochs: int = 2000, **kwargs):
+        """支持对比学习：仅当 padded 索引存在时启用"""
+        use_contrastive = "pos_indices_padded" in self.adata_manager.adata.obsm
+
+        # 清理无关透传参数
+        kwargs.pop("data_loader_class", None)
+        kwargs.pop("datasplitter_kwargs", None)
+
+        if use_contrastive:
+            print("🎯 Using contrastive learning!")
+            try:
+                from src.utils.ContrasiveDataLoader import ContrastiveAnnDataLoader
+                self._data_loader_cls = ContrastiveAnnDataLoader
+
+                if hasattr(self.module, "attach_full_X"):
+                    self.module.attach_full_X(self.adata_manager.adata)
+
+                plan_kwargs = (kwargs.get("plan_kwargs") or {}).copy()
+                plan_kwargs.update({
+                    "lr": kwargs.get("lr", 0.003),
+                    "n_epochs_kl_warmup": kwargs.get("n_epochs_kl_warmup", 200),
+                })
+                kwargs["plan_kwargs"] = plan_kwargs
+
+                print(f"Starting contrastive training with {self._data_loader_cls.__name__} ...")
+                return super().train(max_epochs=max_epochs, **kwargs)
+
+            except Exception as e:
+                print(f"Contrastive training failed: {e}")
+                print("Falling back to standard training...")
+                return self._standard_train(max_epochs, **kwargs)
         else:
-            plan_kwargs = update_dict
-        super().train(
-            max_epochs=max_epochs,
-            accelerator=accelerator,
-            devices=devices,
-            train_size=train_size,
-            validation_size=validation_size,
-            shuffle_set_split=shuffle_set_split,
-            batch_size=batch_size,
-            datasplitter_kwargs=datasplitter_kwargs,
-            plan_kwargs=plan_kwargs,
-            **kwargs,
-        )
+            print("📊 Using standard training (no contrastive pairs)")
+            return self._standard_train(max_epochs, **kwargs)
 
+
+
+    def _standard_train(self, max_epochs: int = 2000, **kwargs):
+        """标准训练方法"""
+        plan_kwargs = kwargs.get('plan_kwargs', {})
+        plan_kwargs.update({
+            'lr': kwargs.get('lr', 0.003),
+            'n_epochs_kl_warmup': kwargs.get('n_epochs_kl_warmup', 200)
+        })
+        kwargs['plan_kwargs'] = plan_kwargs
+        return super().train(max_epochs=max_epochs, **kwargs)
+
+    # @classmethod
+    # @setup_anndata_dsp.dedent
+    # def setup_anndata(
+    #     cls,
+    #     adata: AnnData,
+    #     layer: str | None = None,
+    #     **kwargs,
+    # ):
+    #     """%(summary)s.
+
+    #     Parameters
+    #     ----------
+    #     %(param_adata)s
+    #     %(param_layer)s
+    #     """
+    #     setup_method_args = cls._get_setup_method_args(**locals())
+    #     # add index for each cell (provided to pyro plate for correct minibatching)
+    #     adata.obs["_indices"] = np.arange(adata.n_obs)
+    #     anndata_fields = [
+    #         LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+    #         NumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
+    #     ]
+    #     # 只有当正负对数据存在时才添加对应字段
+    #     if "pos_indices" in adata.obsm:
+    #         anndata_fields.extend([
+    #             ObsmField("pos_indices", "pos_indices"),
+    #             ObsmField("neg_indices", "neg_indices"),
+    #         ])
+        
+    #     if "pos_indices_count" in adata.obs:
+    #         anndata_fields.extend([
+    #             NumericalObsField("pos_indices_count", "pos_indices_count"),
+    #             NumericalObsField("neg_indices_count", "neg_indices_count"),
+    #         ])
+    #     adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
+    #     adata_manager.register_fields(adata, **kwargs)
+    #     cls.register_manager(adata_manager)
     @classmethod
     @setup_anndata_dsp.dedent
     def setup_anndata(
         cls,
-        adata: AnnData,
+        adata,
         layer: str | None = None,
         **kwargs,
     ):
-        """%(summary)s.
-
-        Parameters
-        ----------
-        %(param_adata)s
-        %(param_layer)s
+        """
+        注册 DestVI 所需的 AnnData 字段。
+        - X: 来自指定 layer（计数矩阵）
+        - _indices: 每个观测的整数索引
+        - pos_indices_padded/neg_indices_padded: 填充后的二维索引矩阵（在 obsm）
+        - pos_indices_count/neg_indices_count: 每行有效数量（在 obs）
         """
         setup_method_args = cls._get_setup_method_args(**locals())
-        # add index for each cell (provided to pyro plate for correct minibatching)
-        adata.obs["_indices"] = np.arange(adata.n_obs)
+
+        # 为每个观测创建索引列，供 DataLoader 使用
+        adata.obs["_indices"] = np.arange(adata.n_obs, dtype=int)
+
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
             NumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
         ]
+
+        # 仅注册 padded 字段，拒绝 ragged
+        if "pos_indices_padded" in adata.obsm and "neg_indices_padded" in adata.obsm:
+            anndata_fields.extend([
+                ObsmField("pos_indices_padded", "pos_indices_padded"),
+                ObsmField("neg_indices_padded", "neg_indices_padded"),
+            ])
+        elif "pos_indices" in adata.obsm or "neg_indices" in adata.obsm:
+            raise ValueError("检测到 ragged 的 pos/neg_indices。请先调用 retrofit_padding_for_contrastive_pairs(adata)。")
+
+        if "pos_indices_count" in adata.obs and "neg_indices_count" in adata.obs:
+            anndata_fields.extend([
+                NumericalObsField("pos_indices_count", "pos_indices_count"),
+                NumericalObsField("neg_indices_count", "neg_indices_count"),
+            ])
+
         adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
