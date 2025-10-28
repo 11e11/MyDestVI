@@ -180,28 +180,69 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
             **module_kwargs,
         )
 
+    # def get_proportions(
+    #     self,
+    #     keep_noise: bool = False,
+    #     indices: Sequence[int] | None = None,
+    #     batch_size: int | None = None,
+    # ) -> pd.DataFrame:
+    #     """Returns the estimated cell type proportion for the spatial data.
+
+    #     Shape is n_cells x n_labels OR n_cells x (n_labels + 1) if keep_noise.
+
+    #     Parameters
+    #     ----------
+    #     keep_noise
+    #         whether to account for the noise term as a standalone cell type in the proportion
+    #         estimate.
+    #     indices
+    #         Indices of cells in adata to use. Only used if amortization. If `None`, all cells are
+    #         used.
+    #     batch_size
+    #         Minibatch size for data loading into model. Only used if amortization. Defaults to
+    #         `scvi.settings.batch_size`.
+    #     """
+    #     self._check_if_trained()
+
+    #     column_names = self.cell_type_mapping
+    #     index_names = self.adata.obs.index
+    #     if keep_noise:
+    #         column_names = np.append(column_names, "noise_term")
+
+    #     if self.module.amortization in ["both", "proportion"]:
+    #         stdl = self._make_data_loader(adata=self.adata, indices=indices, batch_size=batch_size)
+    #         prop_ = []
+    #         for tensors in stdl:
+    #             generative_inputs = self.module._get_generative_input(tensors, None)
+    #             prop_local = self.module.get_proportions(
+    #                 x=generative_inputs["x"], keep_noise=keep_noise
+    #             )
+    #             prop_ += [prop_local.cpu()]
+    #         data = torch.cat(prop_).numpy()
+    #         if indices:
+    #             index_names = index_names[indices]
+    #     else:
+    #         if indices is not None:
+    #             logger.info(
+    #                 "No amortization for proportions, ignoring indices and returning results for "
+    #                 "the full data"
+    #             )
+    #         data = self.module.get_proportions(keep_noise=keep_noise)
+
+    #     return pd.DataFrame(
+    #         data=data,
+    #         columns=column_names,
+    #         index=index_names,
+    #     )
+    
+
     def get_proportions(
         self,
         keep_noise: bool = False,
         indices: Sequence[int] | None = None,
         batch_size: int | None = None,
     ) -> pd.DataFrame:
-        """Returns the estimated cell type proportion for the spatial data.
-
-        Shape is n_cells x n_labels OR n_cells x (n_labels + 1) if keep_noise.
-
-        Parameters
-        ----------
-        keep_noise
-            whether to account for the noise term as a standalone cell type in the proportion
-            estimate.
-        indices
-            Indices of cells in adata to use. Only used if amortization. If `None`, all cells are
-            used.
-        batch_size
-            Minibatch size for data loading into model. Only used if amortization. Defaults to
-            `scvi.settings.batch_size`.
-        """
+        """Returns the estimated cell type proportion for the spatial data."""
         self._check_if_trained()
 
         column_names = self.cell_type_mapping
@@ -210,17 +251,28 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
             column_names = np.append(column_names, "noise_term")
 
         if self.module.amortization in ["both", "proportion"]:
-            stdl = self._make_data_loader(adata=self.adata, indices=indices, batch_size=batch_size)
-            prop_ = []
-            for tensors in stdl:
-                generative_inputs = self.module._get_generative_input(tensors, None)
-                prop_local = self.module.get_proportions(
-                    x=generative_inputs["x"], keep_noise=keep_noise
-                )
-                prop_ += [prop_local.cpu()]
-            data = torch.cat(prop_).numpy()
-            if indices:
-                index_names = index_names[indices]
+            # 对于 GAT，需要特殊处理
+            if getattr(self.module, 'use_gat', False):
+                # GAT 模式：直接获取全量结果
+                data = self.module.get_proportions(keep_noise=keep_noise)
+                if isinstance(data, torch.Tensor):
+                    data = data.cpu().numpy()
+                if indices is not None:
+                    data = data[indices]
+                    index_names = index_names[indices]
+            else:
+                # 原始 FC 模式：批次处理
+                stdl = self._make_data_loader(adata=self.adata, indices=indices, batch_size=batch_size)
+                prop_ = []
+                for tensors in stdl:
+                    generative_inputs = self.module._get_generative_input(tensors, None)
+                    prop_local = self.module.get_proportions(
+                        x=generative_inputs["x"], keep_noise=keep_noise
+                    )
+                    prop_ += [prop_local.cpu()]
+                data = torch.cat(prop_).numpy()
+                if indices:
+                    index_names = index_names[indices]
         else:
             if indices is not None:
                 logger.info(
@@ -228,6 +280,8 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
                     "the full data"
                 )
             data = self.module.get_proportions(keep_noise=keep_noise)
+            if isinstance(data, torch.Tensor):
+                data = data.cpu().numpy()
 
         return pd.DataFrame(
             data=data,
