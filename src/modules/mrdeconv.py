@@ -12,6 +12,7 @@ from scvi.nn import FCLayers
 from torch.distributions import Normal, Dirichlet
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv 
+from torch_geometric.nn import GINEConv
 import numpy as np
 
 if TYPE_CHECKING:
@@ -188,44 +189,60 @@ class MRDeconv(BaseModuleClass):
         # within cell_type factor loadings
         _extra_encoder_kwargs = extra_encoder_kwargs or {}
         # if self.use_gat:
-        #     # gamma_encoder: 若使用 GAT -> 多头 GAT 层 + 线性投影
-        #     # 输入 feature: n_genes -> gat_hidden, 最终输出 n_latent * n_labels
+        #     # GIN: 一层 GINConv + 线性投影（保持原有变量名 gamma_gat_layers / V_gat_layers）
         #     self.gamma_gat_layers = torch.nn.ModuleList()
         #     in_ch = self.n_genes
-        #     heads = self.gat_heads
+        #     heads = self.gat_heads   # GIN 不使用 heads，这里仅为兼容保留变量
         #     hidden = self.gat_hidden
 
-            
-        #     # 可堆叠两层 GAT（第一层多头，第二层合并 heads）
-        #     self.gamma_gat_layers.append(GATConv(in_ch, hidden // heads, heads=heads, concat=True))
-        #     self.gamma_gat_layers.append(GATConv(hidden, hidden // 1, heads=1, concat=False))
+        #     # GIN 的 MLP
+        #     gamma_mlp = torch.nn.Sequential(
+        #         torch.nn.Linear(in_ch, hidden),
+        #         torch.nn.ReLU(),
+        #         torch.nn.Linear(hidden, hidden),
+        #     )
+        #     self.gamma_gat_layers.append(GINConv(gamma_mlp))
         #     self.gamma_gat_linear = torch.nn.Linear(hidden, n_latent * n_labels)
 
-        #     # V encoder similar：输出 n_labels + 1
+        #     # V 分支
         #     self.V_gat_layers = torch.nn.ModuleList()
-        #     self.V_gat_layers.append(GATConv(in_ch, hidden // heads, heads=heads, concat=True))
-        #     self.V_gat_layers.append(GATConv(hidden, hidden // 1, heads=1, concat=False))
+        #     v_mlp = torch.nn.Sequential(
+        #         torch.nn.Linear(in_ch, hidden),
+        #         torch.nn.ReLU(),
+        #         torch.nn.Linear(hidden, hidden),
+        #     )
+        #     self.V_gat_layers.append(GINConv(v_mlp))
         #     self.V_gat_linear = torch.nn.Linear(hidden, n_labels + 1)
 
-        #     # placeholder for edge_index（通过 attach_graph 注册）
+        #     # graph buffers（edge_weight 将被忽略，但保留以兼容现有调用）
         #     self.register_buffer("_edge_index", torch.empty((2, 0), dtype=torch.long), persistent=False)
+        #     self.register_buffer("_edge_weight", torch.empty(0, dtype=torch.float32), persistent=False)
+        # 用可以传入边权的GINEConv
         if self.use_gat:
-            # gamma_encoder: 一层多头 GAT 层 + 线性投影
-            self.gamma_gat_layers = torch.nn.ModuleList()
-            in_ch = self.n_genes
-            heads = self.gat_heads
             hidden = self.gat_hidden
+            in_ch = self.n_genes
 
-            # 一层 GAT（多头）
-            self.gamma_gat_layers.append(GATConv(in_ch, hidden // heads, heads=heads, concat=True))
-            self.gamma_gat_linear = torch.nn.Linear(hidden, n_latent * n_labels)
+            def mlp_block(in_dim, out_dim):
+                return torch.nn.Sequential(
+                    torch.nn.Linear(in_dim, hidden),
+                    torch.nn.BatchNorm1d(hidden),
+                    torch.nn.ReLU(),
+                    torch.nn.Dropout(p=0.1),
+                    torch.nn.Linear(hidden, out_dim),
+                )
 
-            # V encoder similar：输出 n_labels + 1
-            self.V_gat_layers = torch.nn.ModuleList()
-            self.V_gat_layers.append(GATConv(in_ch, hidden // heads, heads=heads, concat=True))
-            self.V_gat_linear = torch.nn.Linear(hidden, n_labels + 1)
+            self.gamma_gat_layers = torch.nn.ModuleList([
+                GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+            ])
+            self.gamma_gat_linear = torch.nn.Linear(hidden, self.n_latent * self.n_labels)
+            self.gamma_ln = torch.nn.LayerNorm(hidden)
 
-            # placeholder for edge_index（通过 attach_graph 注册）
+            self.V_gat_layers = torch.nn.ModuleList([
+                GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+            ])
+            self.V_gat_linear = torch.nn.Linear(hidden, self.n_labels + 1)
+            self.V_ln = torch.nn.LayerNorm(hidden)
+
             self.register_buffer("_edge_index", torch.empty((2, 0), dtype=torch.long), persistent=False)
             self.register_buffer("_edge_weight", torch.empty(0, dtype=torch.float32), persistent=False)
         else:
@@ -525,73 +542,80 @@ class MRDeconv(BaseModuleClass):
         library = torch.sum(x, dim=1, keepdim=True)
         beta = torch.exp(self.beta)
         eps = torch.nn.functional.softplus(self.eta)
-        x_ = torch.log(1 + x)
+        # x_ = torch.log(1 + x)
 
+        x_ = torch.log1p(torch.clamp_min(x, 0.0))
+        if self.use_gat:
+            if self._edge_index.numel() == 0:
+                raise RuntimeError("use_gat=True 需要先调用 attach_graph(...)")
+            if not hasattr(self, "_X_all"):
+                raise RuntimeError("use_gat=True 需要先调用 attach_full_X(adata)")
+
+            X_all = torch.clamp_min(self._X_all.to(x.device, dtype=torch.float32), 0.0)
+            X_all_log = torch.log1p(X_all)
+            edge_index = self._edge_index
+            edge_attr = getattr(self, "_edge_weight", None)
+            edge_attr = edge_attr.to(x.device).unsqueeze(-1) if edge_attr is not None and edge_attr.numel() > 0 else None
+
+            # gamma 分支（全图 -> 按 ind_x 取 batch）
+            h = self.gamma_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
+            h = self.gamma_ln(h)
+            h = F.elu(h)
+            gamma_raw_all = self.gamma_gat_linear(h)                      # [N, n_latent*n_labels]
+            gamma_mb = gamma_raw_all[ind_x, :]                            # [m, n_latent*n_labels]
+            gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent).permute(2, 1, 0)
+
+            # V 分支（全图 -> 按 ind_x 取 batch）
+            h2 = self.V_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
+            h2 = self.V_ln(h2)
+            h2 = F.elu(h2)
+            v_raw_all = self.V_gat_linear(h2)                             # [N, n_labels+1]
+            v_ind = v_raw_all[ind_x, :]                                   # [m, n_labels+1]
+        
         # if self.use_gat:
         #     edge_index = self._edge_index
-        #     edge_weight = getattr(self, '_edge_weight', None)  # 可能没有权重
-            
+        #     # edge_weight = getattr(self, '_edge_weight', None)  # GIN 不用权重
+
         #     if edge_index.numel() == 0:
         #         raise RuntimeError("use_gat=True 需要先调用 attach_graph(...) 注册 edge_index")
         #     if not hasattr(self, "_X_all"):
         #         raise RuntimeError("use_gat=True 需要先调用 attach_full_X(adata) 缓存全量 X")
 
-        #     X_all = self._X_all.to(x.device, dtype=torch.float32)
+        #     # X_all = self._X_all.to(x.device, dtype=torch.float32)
+        #     # X_all_log = torch.log1p(X_all)
+
+        #     # # gamma 分支（GINConv 不接受 edge_weight）
+        #     # h = X_all_log
+        #     # layer = self.gamma_gat_layers[0]
+        #     # h = F.elu(layer(h, edge_index))
+        #     # gamma_raw_all = self.gamma_gat_linear(h)
+        #     # gamma_mb = gamma_raw_all[ind_x, :]
+        #     # gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent).permute(2, 1, 0)
+
+        #     # # V 分支
+        #     # h2 = X_all_log
+        #     # layer = self.V_gat_layers[0]
+        #     # h2 = F.elu(layer(h2, edge_index))
+        #     # v_raw_all = self.V_gat_linear(h2)
+        #     # v_ind = v_raw_all[ind_x, :]
+        #     # 3) 前向：把 edge_weight 当作 edge_attr 传进去（形状 [E,1]）
+        #     # ...existing code...
+        #     X_all = self._X_all.to(x.device, dtype=torch.float32).clamp_min(0)
         #     X_all_log = torch.log1p(X_all)
+        #     edge_index = self._edge_index
+        #     edge_attr = getattr(self, "_edge_weight", None)
+        #     edge_attr = edge_attr.unsqueeze(-1) if edge_attr is not None and edge_attr.numel() > 0 else None
 
-        #     # gamma GAT - 传入边权重
-        #     h = X_all_log
-        #     for layer in self.gamma_gat_layers:
-        #         if edge_weight is not None:
-        #             h = F.elu(layer(h, edge_index, edge_weight.to(x.device)))
-        #         else:
-        #             h = F.elu(layer(h, edge_index))
+        #     # gamma 分支
+        #     h = self.gamma_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
+        #     h = self.gamma_ln(h)
+        #     h = F.elu(h)
         #     gamma_raw_all = self.gamma_gat_linear(h)
-        #     gamma_mb = gamma_raw_all[ind_x, :]
-        #     gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent).permute(2, 1, 0)
-
-        #     # V GAT - 传入边权重
-        #     h2 = X_all_log
-        #     for layer in self.V_gat_layers:
-        #         if edge_weight is not None:
-        #             h2 = F.elu(layer(h2, edge_index, edge_weight.to(x.device)))
-        #         else:
-        #             h2 = F.elu(layer(h2, edge_index))
+        #     # V 分支
+        #     h2 = self.V_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
+        #     h2 = self.V_ln(h2)
+        #     h2 = F.elu(h2)
         #     v_raw_all = self.V_gat_linear(h2)
-        #     v_ind = v_raw_all[ind_x, :]
-        # 修改 generative 方法中的 GAT 调用，改成单层
-        if self.use_gat:
-            edge_index = self._edge_index
-            edge_weight = getattr(self, '_edge_weight', None)  # 可能没有权重
-
-            if edge_index.numel() == 0:
-                raise RuntimeError("use_gat=True 需要先调用 attach_graph(...) 注册 edge_index")
-            if not hasattr(self, "_X_all"):
-                raise RuntimeError("use_gat=True 需要先调用 attach_full_X(adata) 缓存全量 X")
-
-            X_all = self._X_all.to(x.device, dtype=torch.float32)
-            X_all_log = torch.log1p(X_all)
-
-            # gamma GAT - 传入边权重
-            h = X_all_log
-            layer = self.gamma_gat_layers[0]
-            if edge_weight is not None:
-                h = F.elu(layer(h, edge_index, edge_weight.to(x.device)))
-            else:
-                h = F.elu(layer(h, edge_index))
-            gamma_raw_all = self.gamma_gat_linear(h)
-            gamma_mb = gamma_raw_all[ind_x, :]
-            gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent).permute(2, 1, 0)
-
-            # V GAT - 传入边权重
-            h2 = X_all_log
-            layer = self.V_gat_layers[0]
-            if edge_weight is not None:
-                h2 = F.elu(layer(h2, edge_index, edge_weight.to(x.device)))
-            else:
-                h2 = F.elu(layer(h2, edge_index))
-            v_raw_all = self.V_gat_linear(h2)
-            v_ind = v_raw_all[ind_x, :]
 
         else:
             # 原来的 FC 分支保持不变
@@ -696,42 +720,7 @@ class MRDeconv(BaseModuleClass):
         """Sample from the posterior."""
         raise NotImplementedError("No sampling method for DestVI")
 
-    # 同样修改 get_proportions 和 get_gamma 中的 GAT 调用
-    # @torch.inference_mode()
-    # @auto_move_data
-    # def get_proportions(self, x=None, keep_noise=False):
-    #     if self.amortization in ["both", "proportion"]:
-    #         if self.use_gat:
-    #             if not hasattr(self, "_X_all"):
-    #                 raise RuntimeError("use_gat=True 需要先调用 attach_full_X(...)")
-    #             if self._edge_index.numel() == 0:
-    #                 raise RuntimeError("use_gat=True 需要先调用 attach_graph(...)")
-
-    #             X_all = self._X_all.to(self.px_o.device, dtype=torch.float32)
-    #             X_all_log = torch.log1p(X_all)
-    #             edge_weight = getattr(self, '_edge_weight', None)
-                
-    #             h = X_all_log
-    #             for layer in self.V_gat_layers:
-    #                 if edge_weight is not None:
-    #                     h = F.elu(layer(h, self._edge_index, edge_weight.to(self.px_o.device)))
-    #                 else:
-    #                     h = F.elu(layer(h, self._edge_index))
-    #             res = torch.nn.functional.softplus(self.V_gat_linear(h))
-    #         else:
-    #             x_ = torch.log(1 + x)
-    #             res = torch.nn.functional.softplus(self.V_encoder(x_))
-    #     else:
-    #         res = torch.nn.functional.softplus(self.V)  
-    #         if res.dim() == 2 and res.shape[0] == self.n_labels + 1:
-    #             res = res.T
-
-    #     if not keep_noise:
-    #         res = res[:, :-1]
-    #     res = res / res.sum(axis=1, keepdims=True)
-    #     return res
-
-    # 单层GAT版本
+     # 单层GIN版本
     @torch.inference_mode()
     @auto_move_data
     def get_proportions(self, x=None, keep_noise=False):
@@ -742,16 +731,22 @@ class MRDeconv(BaseModuleClass):
                 if self._edge_index.numel() == 0:
                     raise RuntimeError("use_gat=True 需要先调用 attach_graph(...)")
 
-                X_all = self._X_all.to(self.px_o.device, dtype=torch.float32)
-                X_all_log = torch.log1p(X_all)
-                edge_weight = getattr(self, '_edge_weight', None)
+                # X_all = self._X_all.to(self.px_o.device, dtype=torch.float32)
+                # X_all_log = torch.log1p(X_all)
 
-                h = X_all_log
-                layer = self.V_gat_layers[0]
-                if edge_weight is not None:
-                    h = F.elu(layer(h, self._edge_index, edge_weight.to(self.px_o.device)))
-                else:
-                    h = F.elu(layer(h, self._edge_index))
+                # h = X_all_log
+                # layer = self.V_gat_layers[0]
+                # h = F.elu(layer(h, self._edge_index))  # 无 edge_weight
+                # res = torch.nn.functional.softplus(self.V_gat_linear(h))
+                # 4) get_proportions / get_gamma 同样传 edge_attr 并加简单归一化
+                X_all = torch.clamp_min(self._X_all.to(self.px_o.device, dtype=torch.float32), 0.0)
+                X_all_log = torch.log1p(X_all)
+                edge_attr = getattr(self, "_edge_weight", None)
+                edge_attr = edge_attr.to(self.px_o.device).unsqueeze(-1) if edge_attr is not None and edge_attr.numel() > 0 else None
+
+                h = self.V_gat_layers[0](X_all_log, self._edge_index, edge_attr=edge_attr)
+                h = self.V_ln(h)
+                h = F.elu(h)
                 res = torch.nn.functional.softplus(self.V_gat_linear(h))
             else:
                 x_ = torch.log(1 + x)
@@ -763,40 +758,11 @@ class MRDeconv(BaseModuleClass):
 
         if not keep_noise:
             res = res[:, :-1]
-        res = res / res.sum(axis=1, keepdims=True)
+        res = res / (res.sum(axis=1, keepdims=True)+ 1e-8)
         return res
 
-    # @torch.inference_mode()
-    # @auto_move_data
-    # def get_gamma(self, x: torch.Tensor = None):
-    #     if self.amortization in ["latent", "both"]:
-    #         if self.use_gat:
-    #             if not hasattr(self, "_X_all"):
-    #                 raise RuntimeError("use_gat=True 需要先调用 attach_full_X(...)")
-    #             if self._edge_index.numel() == 0:
-    #                 raise RuntimeError("use_gat=True 需要先调用 attach_graph(...)")
 
-    #             X_all = self._X_all.to(self.px_o.device, dtype=torch.float32)
-    #             X_all_log = torch.log1p(X_all)
-    #             edge_weight = getattr(self, '_edge_weight', None)
-                
-    #             h = X_all_log
-    #             for layer in self.gamma_gat_layers:
-    #                 if edge_weight is not None:
-    #                     h = F.elu(layer(h, self._edge_index, edge_weight.to(self.px_o.device)))
-    #                 else:
-    #                     h = F.elu(layer(h, self._edge_index))
-    #             gamma_raw_all = self.gamma_gat_linear(h)
-    #             N = gamma_raw_all.size(0)
-    #             gamma = gamma_raw_all.view(N, self.n_labels, self.n_latent).permute(2, 1, 0)
-    #             return gamma.cpu().numpy()
-    #         else:
-    #             x_ = torch.log(1 + x)
-    #             gamma = self.gamma_encoder(x_)
-    #             return torch.transpose(gamma, 0, 1).reshape((self.n_latent, self.n_labels, -1)).cpu().numpy()
-    #     else:
-    #         return self.gamma.cpu().numpy()
-    # 单层GAT版本
+    # 单层GIN版本
     @torch.inference_mode()
     @auto_move_data
     def get_gamma(self, x: torch.Tensor = None):
@@ -807,17 +773,15 @@ class MRDeconv(BaseModuleClass):
                 if self._edge_index.numel() == 0:
                     raise RuntimeError("use_gat=True 需要先调用 attach_graph(...)")
 
-                X_all = self._X_all.to(self.px_o.device, dtype=torch.float32)
+                X_all = torch.clamp_min(self._X_all.to(self.px_o.device, dtype=torch.float32), 0.0)
                 X_all_log = torch.log1p(X_all)
-                edge_weight = getattr(self, '_edge_weight', None)
+                edge_attr = getattr(self, "_edge_weight", None)
+                edge_attr = edge_attr.to(self.px_o.device).unsqueeze(-1) if edge_attr is not None and edge_attr.numel() > 0 else None
 
-                h = X_all_log
-                layer = self.gamma_gat_layers[0]
-                if edge_weight is not None:
-                    h = F.elu(layer(h, self._edge_index, edge_weight.to(self.px_o.device)))
-                else:
-                    h = F.elu(layer(h, self._edge_index))
-                gamma_raw_all = self.gamma_gat_linear(h)
+                h = self.gamma_gat_layers[0](X_all_log, self._edge_index, edge_attr=edge_attr)
+                h = self.gamma_ln(h)
+                h = F.elu(h)
+                gamma_raw_all = self.gamma_gat_linear(h)                  # [N, n_latent*n_labels]
                 N = gamma_raw_all.size(0)
                 gamma = gamma_raw_all.view(N, self.n_labels, self.n_latent).permute(2, 1, 0)
                 return gamma.cpu().numpy()
