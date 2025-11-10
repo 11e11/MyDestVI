@@ -828,3 +828,45 @@ class MRDeconv(BaseModuleClass):
         px_scale = self.px_decoder(h)  # (minibatch, n_genes)
         px_ct = torch.exp(self.px_o).unsqueeze(0) * beta.unsqueeze(0) * px_scale
         return px_ct  # shape (minibatch, genes)
+    
+    @torch.inference_mode()
+    def get_graph_embeddings(self, branch: str = "V", projected: bool = False, return_numpy: bool = True):
+        """
+        导出图编码器的嵌入。
+        branch: 'V' 使用比例分支编码器；'gamma' 使用 latent 分支编码器
+        projected: True 则返回线性投影后的表示（V_gat_linear / gamma_gat_linear 之前的 softplus/reshape 之前）
+        """
+        if not self.use_gat:
+            raise RuntimeError("use_gat=False 时无图编码器嵌入")
+        if not hasattr(self, "_X_all"):
+            raise RuntimeError("需要先调用 attach_full_X(...)")
+        if self._edge_index.numel() == 0:
+            raise RuntimeError("需要先调用 attach_graph(...)")
+
+        X_all = torch.clamp_min(self._X_all.to(self.px_o.device, dtype=torch.float32), 0.0)
+        X_all_log = torch.log1p(X_all)
+        edge_attr = getattr(self, "_edge_weight", None)
+        edge_attr = edge_attr.to(self.px_o.device).unsqueeze(-1) if edge_attr is not None and edge_attr.numel() > 0 else None
+
+        if branch.lower() == "v":
+            h = self.V_gat_layers[0](X_all_log, self._edge_index, edge_attr=edge_attr)
+            h = self.V_ln(h)
+            h = F.elu(h)
+            if projected:
+                z = self.V_gat_linear(h)  # [N, n_labels+1]
+            else:
+                z = h                      # [N, hidden]
+        elif branch.lower() == "gamma":
+            h = self.gamma_gat_layers[0](X_all_log, self._edge_index, edge_attr=edge_attr)
+            h = self.gamma_ln(h)
+            h = F.elu(h)
+            if projected:
+                z = self.gamma_gat_linear(h)  # [N, n_latent*n_labels]
+            else:
+                z = h
+        else:
+            raise ValueError("branch 必须是 'V' 或 'gamma'")
+
+        if return_numpy:
+            return z.detach().cpu().numpy()
+        return z
