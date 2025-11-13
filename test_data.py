@@ -259,15 +259,15 @@ from src.models.mydestvi import DestVI
 
 """
 python test_data.py \
-  --sc-h5ad ../../data/simulation_Mouse_Kidney_MERFISH/MERFISH_kidney_object.h5ad \
-  --st-h5ad ../../data/simulation_Mouse_Kidney_MERFISH/MK_simulated_ST.h5ad\
+  --sc-h5ad ../data/simulation_Mouse_Kidney_MERFISH/MERFISH_kidney_object.h5ad \
+  --st-h5ad ../data/simulation_Mouse_Kidney_MERFISH/MK_simulated_ST.h5ad\
   --device cuda \
-  --epochs-sc 300 \
-  --epochs-st 1500 \
+  --epochs-sc 20 \
+  --epochs-st 50 \
   --batch-size 128 \
-  --log-file log.txt \
+  --log-file log2.txt \
   --prop-csv mydestvi_predicted_proportions_mmdAndL1.csv
-  效果不好
+  模型不收敛
 """
 
 def move_item_to_device(item: dict, device: torch.device) -> dict:

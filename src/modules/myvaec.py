@@ -1,19 +1,16 @@
 """
-VAEC模块 - 简化版
-主要改动：删除 _get_inference_input, _get_generative_input
+VAEC模块 - 修订版：恢复真正的条件 VAE 行为并修复方差与初始化问题
 """
 import torch
 import torch.nn as nn
 from torch.distributions import Normal, kl_divergence
 
-# 建议直接从子模块导入，进一步减少耦合
 from src.nn.encoder import Encoder
 from src.nn.layers import FCLayers
 from src.distributions.negative_binomial import NegativeBinomial
 
 
 class VAEC(nn.Module):
-
     def __init__(
         self,
         n_input: int,
@@ -25,6 +22,7 @@ class VAEC(nn.Module):
         dropout_rate: float = 0.05,
         ct_weight=None,
         encode_covariates: bool = False,
+        log_variational: bool = True,   # 新增：与 scvi 接口对齐
     ):
         super().__init__()
 
@@ -33,11 +31,12 @@ class VAEC(nn.Module):
         self.n_batch = n_batch
         self.dropout_rate = dropout_rate
         self.encode_covariates = encode_covariates
+        self.log_variational = log_variational
 
-        # NB 参数（dispersion 的 logits）
-        self.px_r = nn.Parameter(torch.zeros(n_input))  # 更稳健的初始化
+        # 改：px_r 使用近零高斯初始化，提高数值稳定性
+        self.px_r = nn.Parameter(torch.randn(n_input) * 0.01)
 
-        # 编码器
+        # 编码器：必须 inject_covariates=True
         encoder_cat_list = [n_labels]
         if n_batch > 0 and encode_covariates:
             encoder_cat_list.append(n_batch)
@@ -51,10 +50,11 @@ class VAEC(nn.Module):
             dropout_rate=dropout_rate,
             use_batch_norm=False,
             use_layer_norm=True,
-            return_dist=True,  # 直接返回 Normal 分布
+            return_dist=True,
+            inject_covariates=True,  # 关键
         )
 
-        # 解码器
+        # 解码器：同样条件化
         decoder_cat_list = [n_labels]
         if n_batch > 0:
             decoder_cat_list.append(n_batch)
@@ -68,6 +68,7 @@ class VAEC(nn.Module):
             dropout_rate=dropout_rate,
             use_batch_norm=False,
             use_layer_norm=True,
+            inject_covariates=True,  # 关键
         )
 
         self.px_decoder = nn.Sequential(
@@ -92,7 +93,7 @@ class VAEC(nn.Module):
 
     def inference(self, x, labels, batch_index=None):
         library = x.sum(1, keepdim=True)
-        x_ = torch.log1p(x)
+        x_ = torch.log1p(x) if self.log_variational else x
 
         labels_1d = self._to_1d_long(labels)
         batch_1d = self._to_1d_long(batch_index) if self.encode_covariates else None
@@ -101,28 +102,25 @@ class VAEC(nn.Module):
         if batch_1d is not None:
             cat_list.append(batch_1d)
 
+        # 这里 Encoder 返回 (qz, z)
         if len(cat_list) == 0:
             enc_out = self.z_encoder(x_)
         else:
             enc_out = self.z_encoder(x_, cat_list)
 
-        # 下方保持你当前的分支逻辑（Normal / (mu, logvar) 等）
-        if isinstance(enc_out, Normal):
+        if isinstance(enc_out, tuple) and len(enc_out) == 2 and isinstance(enc_out[0], Normal):
+            qz, z = enc_out
+        elif isinstance(enc_out, Normal):
             qz = enc_out
             z = qz.rsample()
         elif isinstance(enc_out, tuple) and len(enc_out) == 2:
-            if isinstance(enc_out[0], Normal):
-                qz, z = enc_out
-            else:
-                mu, logvar_or_var = enc_out
-                if (logvar_or_var < 0).any():
-                    std = (logvar_or_var * 0.5).exp()
-                else:
-                    std = logvar_or_var.clamp_min(1e-8).sqrt()
-                qz = Normal(mu, std)
-                z = qz.rsample()
+            # 严格认为第二个是 logvar
+            mu, logvar = enc_out
+            std = torch.exp(0.5 * logvar)
+            qz = Normal(mu, std)
+            z = qz.rsample()
         else:
-            raise TypeError("z_encoder 返回格式不对，期待 Normal 或 (mu,logvar) 或 (qz,z)")
+            raise TypeError("Encoder 输出格式不符合预期")
 
         return {
             'z': z,
@@ -163,11 +161,11 @@ class VAEC(nn.Module):
         qz_v = inference_outputs['qz_v']
 
         reconst_loss = -NegativeBinomial(px_rate, logits=self.px_r).log_prob(x).sum(-1)
-        pz = Normal(torch.zeros_like(qz_m), torch.ones_like(qz_v))
+
+        pz = Normal(torch.zeros_like(qz_m), torch.ones_like(qz_m))
         qz = Normal(qz_m, torch.sqrt(qz_v))
         kl_divergence_z = kl_divergence(qz, pz).sum(dim=1)
 
-        # 注意：labels 可能是 [B]，直接用于索引即可
         labels_1d = self._to_1d_long(labels)
         scaling_factor = self.ct_weight[labels_1d]
 

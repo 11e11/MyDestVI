@@ -1,0 +1,18 @@
+启动时间: 2025-11-13 15:04:26
+参数: Namespace(sc_h5ad='../data/simulation_Mouse_Kidney_MERFISH/MERFISH_kidney_object.h5ad', st_h5ad='../data/simulation_Mouse_Kidney_MERFISH/MK_simulated_ST.h5ad', device='cuda', epochs=None, epochs_sc=20, epochs_st=50, batch_size=128, lr=0.001, layer='counts', labels_key='free_annotation', log_file='log2.txt', prop_csv='mydestvi_predicted_proportions_mmdAndL1.csv')
+实际使用 epochs_sc=20, epochs_st=50
+Loading sc AnnData: ../data/simulation_Mouse_Kidney_MERFISH/MERFISH_kidney_object.h5ad
+AnnData object with n_obs × n_vars = 126547 × 307
+    obs: 'fov', 'volume', 'center_x', 'center_y', 'min_x', 'min_y', 'max_x', 'max_y', 'barcodeCount', 'average_DAPI_score', 'area', 'n_counts', 'leiden', 'free_annotation'
+    uns: 'free_annotation_colors', 'leiden', 'leiden_colors', 'log1p', 'neighbors', 'pca', 'rank_genes_groups', 'umap'
+    obsm: 'X_pca', 'X_umap', 'spatial'
+    varm: 'PCs'
+    layers: 'counts'
+    obsp: 'connectivities', 'distances'
+Loading st AnnData: ../data/simulation_Mouse_Kidney_MERFISH/MK_simulated_ST.h5ad
+AnnData object with n_obs × n_vars = 1520 × 307
+    obs: 'spot_id', 'n_cells'
+    uns: 'cell_types'
+    obsm: 'spatial', 'true_proportion'
+cell_type_mapping（与SC编码顺序一致）: {'endothelial cell': 0, 'epithelial cell of proximal tubule': 1, 'kidney collecting duct epithelial cell': 2, 'kidney distal convoluted tubule epithelial cell': 3, 'kidney loop of Henle epithelial cell': 4, 'podocyte': 5, 'immune cell': 6, 'pericyte': 7}
+Instantiating CondSCVI: n_input=307, n_labels=8
