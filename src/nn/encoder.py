@@ -1,81 +1,90 @@
 """
-简单可用的 Encoder 实现：
-- 使用 FCLayers 作为特征提取主干（支持类别条件 n_cat_list）
-- 两个线性头：mu_layer, var_layer（输出 logvar）
-- 当 return_dist=True 时，返回 torch.distributions.Normal(loc=mu, scale=std)
+Fixed conditional Encoder:
+- Always treats provided categorical variables (labels, optional batch) as conditional inputs.
+- One-hot them and concatenate to raw count input (after log1p 可选).
+- No inject_covariates flag.
 """
 from __future__ import annotations
-
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-
-# 注意：使用相对导入，避免 from src.nn 导致循环
 from .layers import FCLayers
-
+import torch.nn.functional as F
 
 class Encoder(nn.Module):
     def __init__(
         self,
-        n_input: int,
+        n_input: int,        # gene count features
         n_latent: int,
-        n_cat_list=None,
+        n_labels: int,       # number of cell types
+        n_batch: int = 0,    # number of batches (0 -> no batch covariate)
         n_layers: int = 2,
         n_hidden: int = 128,
         dropout_rate: float = 0.05,
         use_batch_norm: bool = False,
         use_layer_norm: bool = True,
-        return_dist: bool = False,
+        return_dist: bool = True,
+        log_variational: bool = True,
     ):
         super().__init__()
-        if n_cat_list is None:
-            n_cat_list = []
+        self.n_input = n_input
+        self.n_latent = n_latent
+        self.n_labels = n_labels
+        self.n_batch = n_batch
+        self.return_dist = return_dist
+        self.log_variational = log_variational
 
-        # 主干 MLP（支持条件输入）
-        self.net = FCLayers(
-            n_in=n_input,
+        # 计算扩展后的输入维度： genes + one-hot(labels) + one-hot(batch?)
+        self.cat_dim = n_labels + (n_batch if n_batch > 0 else 0)
+        effective_n_in = n_input + self.cat_dim
+
+        self.backbone = FCLayers(
+            n_in=effective_n_in,
             n_out=n_hidden,
-            n_cat_list=n_cat_list,
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=dropout_rate,
             use_batch_norm=use_batch_norm,
             use_layer_norm=use_layer_norm,
         )
-
-        # 头部
         self.mu_layer = nn.Linear(n_hidden, n_latent)
-        self.var_layer = nn.Linear(n_hidden, n_latent)  # 输出 logvar
+        self.var_layer = nn.Linear(n_hidden, n_latent)
 
-        self.return_dist = return_dist
+    def _one_hot_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        labels = labels.view(-1).long()
+        return F.one_hot(labels, num_classes=self.n_labels).float()
 
-    def forward(self, x: torch.Tensor, cat_list=None, return_dist: bool | None = None):
-        """
-        x: [B, n_input]
-        cat_list: None 或 [labels, (batch_index, ...)]，每个应为 [B] 的 LongTensor
-        return_dist: 若为 None 则用 self.return_dist
-        """
-        # 统一 cat_list 形状为 1D
-        if cat_list is not None:
-            proc = []
-            for t in cat_list:
-                if t is None:
-                    continue
-                if t.dim() > 1:
-                    t = t.squeeze(-1)
-                t = t.long()
-                proc.append(t)
-            cat_list = proc if len(proc) > 0 else None
+    def _one_hot_batch(self, batch_index: torch.Tensor | None) -> torch.Tensor | None:
+        if self.n_batch <= 0 or batch_index is None:
+            return None
+        b = batch_index.view(-1).long()
+        return F.one_hot(b, num_classes=self.n_batch).float()
 
-        # 前向
-        h = self.net(x, cat_list) if cat_list is not None else self.net(x)
+    def forward(
+        self,
+        x: torch.Tensor,          # [B, n_input]
+        labels: torch.Tensor,     # [B] ints
+        batch_index: torch.Tensor | None = None,
+    ):
+        if self.log_variational:
+            x_proc = torch.log1p(torch.clamp_min(x, 0.0))
+        else:
+            x_proc = x
 
+        oh_labels = self._one_hot_labels(labels)
+        oh_batch = self._one_hot_batch(batch_index)
+        if oh_batch is not None:
+            x_cat = torch.cat([x_proc, oh_labels, oh_batch], dim=1)
+        else:
+            x_cat = torch.cat([x_proc, oh_labels], dim=1)
+
+        h = self.backbone(x_cat)
         mu = self.mu_layer(h)
         logvar = self.var_layer(h)
         std = torch.exp(0.5 * logvar)
 
-        use_dist = self.return_dist if return_dist is None else return_dist
-        if use_dist:
-            return Normal(loc=mu, scale=std)  # 与 VAEC.inference 期望兼容
+        qz = Normal(mu, std)
+        if self.return_dist:
+            return qz, qz.rsample()
         else:
             return mu, logvar

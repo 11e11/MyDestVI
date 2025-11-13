@@ -1,14 +1,16 @@
 """
-VAEC模块 - 修订版：恢复真正的条件 VAE 行为并修复方差与初始化问题
+VAEC 固定条件版：
+- 始终使用细胞类型 (labels) + 可选 batch 的 one-hot 拼接。
+- 去除 inject_covariates 相关逻辑。
+- 与 scvi CondSCVI 行为类似：inference 返回 Normal 分布。
 """
 import torch
 import torch.nn as nn
 from torch.distributions import Normal, kl_divergence
-
 from src.nn.encoder import Encoder
 from src.nn.layers import FCLayers
 from src.distributions.negative_binomial import NegativeBinomial
-
+import torch.nn.functional as F
 
 class VAEC(nn.Module):
     def __init__(
@@ -21,59 +23,52 @@ class VAEC(nn.Module):
         n_layers: int = 2,
         dropout_rate: float = 0.05,
         ct_weight=None,
-        encode_covariates: bool = False,
-        log_variational: bool = True,   # 新增：与 scvi 接口对齐
+        encode_covariates: bool = False,   # 保留参数名但逻辑统一
+        log_variational: bool = True,
     ):
         super().__init__()
-
-        self.n_latent = n_latent
+        self.n_input = n_input
         self.n_labels = n_labels
-        self.n_batch = n_batch
+        self.n_batch = n_batch if encode_covariates else 0
+        self.n_hidden = n_hidden
+        self.n_latent = n_latent
+        self.n_layers = n_layers
         self.dropout_rate = dropout_rate
-        self.encode_covariates = encode_covariates
         self.log_variational = log_variational
 
-        # 改：px_r 使用近零高斯初始化，提高数值稳定性
-        self.px_r = nn.Parameter(torch.randn(n_input) * 0.01)
+        # dispersion logits (per gene)
+        self.px_r = nn.Parameter(torch.zeros(n_input))
 
-        # 编码器：必须 inject_covariates=True
-        encoder_cat_list = [n_labels]
-        if n_batch > 0 and encode_covariates:
-            encoder_cat_list.append(n_batch)
-
+        # Encoder (固定条件拼接)
         self.z_encoder = Encoder(
             n_input=n_input,
             n_latent=n_latent,
-            n_cat_list=encoder_cat_list,
+            n_labels=n_labels,
+            n_batch=self.n_batch,
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=dropout_rate,
             use_batch_norm=False,
             use_layer_norm=True,
             return_dist=True,
-            inject_covariates=True,  # 关键
+            log_variational=log_variational,
         )
 
-        # 解码器：同样条件化
-        decoder_cat_list = [n_labels]
-        if n_batch > 0:
-            decoder_cat_list.append(n_batch)
-
-        self.decoder = FCLayers(
-            n_in=n_latent,
+        # Decoder: 输入是 latent z + one-hot(labels) (+ one-hot(batch))
+        cat_dim = n_labels + (self.n_batch if self.n_batch > 0 else 0)
+        decoder_in = n_latent + cat_dim
+        self.decoder_backbone = FCLayers(
+            n_in=decoder_in,
             n_out=n_hidden,
-            n_cat_list=decoder_cat_list,
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=dropout_rate,
             use_batch_norm=False,
             use_layer_norm=True,
-            inject_covariates=True,  # 关键
         )
-
         self.px_decoder = nn.Sequential(
             nn.Linear(n_hidden, n_input),
-            nn.Softplus()
+            nn.Softplus(),
         )
 
         # 细胞类型权重
@@ -81,97 +76,64 @@ class VAEC(nn.Module):
             ct_weight = torch.ones(n_labels)
         else:
             ct_weight = torch.tensor(ct_weight, dtype=torch.float32)
-        self.register_buffer('ct_weight', ct_weight)
+        self.register_buffer("ct_weight", ct_weight)
 
-    @staticmethod
-    def _to_1d_long(t: torch.Tensor | None) -> torch.Tensor | None:
-        if t is None:
+    def _one_hot_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        labels = labels.view(-1).long()
+        return F.one_hot(labels, num_classes=self.n_labels).float()
+
+    def _one_hot_batch(self, batch_index: torch.Tensor | None) -> torch.Tensor | None:
+        if self.n_batch <= 0 or batch_index is None:
             return None
-        if t.dim() == 2 and t.size(-1) == 1:
-            t = t.squeeze(-1)
-        return t.long()
+        b = batch_index.view(-1).long()
+        return F.one_hot(b, num_classes=self.n_batch).float()
 
     def inference(self, x, labels, batch_index=None):
+        # 使用 Encoder 得到 q(z|x)
+        qz, z = self.z_encoder(x, labels, batch_index)
         library = x.sum(1, keepdim=True)
-        x_ = torch.log1p(x) if self.log_variational else x
-
-        labels_1d = self._to_1d_long(labels)
-        batch_1d = self._to_1d_long(batch_index) if self.encode_covariates else None
-
-        cat_list = [labels_1d] if labels_1d is not None else []
-        if batch_1d is not None:
-            cat_list.append(batch_1d)
-
-        # 这里 Encoder 返回 (qz, z)
-        if len(cat_list) == 0:
-            enc_out = self.z_encoder(x_)
-        else:
-            enc_out = self.z_encoder(x_, cat_list)
-
-        if isinstance(enc_out, tuple) and len(enc_out) == 2 and isinstance(enc_out[0], Normal):
-            qz, z = enc_out
-        elif isinstance(enc_out, Normal):
-            qz = enc_out
-            z = qz.rsample()
-        elif isinstance(enc_out, tuple) and len(enc_out) == 2:
-            # 严格认为第二个是 logvar
-            mu, logvar = enc_out
-            std = torch.exp(0.5 * logvar)
-            qz = Normal(mu, std)
-            z = qz.rsample()
-        else:
-            raise TypeError("Encoder 输出格式不符合预期")
-
         return {
-            'z': z,
-            'qz': qz,
-            'qz_m': qz.loc,
-            'qz_v': qz.scale.pow(2),
-            'library': library,
+            "z": z,
+            "qz": qz,
+            "qz_m": qz.loc,
+            "qz_v": qz.scale.pow(2),
+            "library": library,
         }
 
     def generative(self, z, library, labels, batch_index=None):
-        labels_1d = self._to_1d_long(labels)
-        batch_1d = self._to_1d_long(batch_index)
+        oh_labels = self._one_hot_labels(labels)
+        oh_batch = self._one_hot_batch(batch_index)
+        if oh_batch is not None:
+            dec_in = torch.cat([z, oh_labels, oh_batch], dim=1)
+        else:
+            dec_in = torch.cat([z, oh_labels], dim=1)
 
-        cat_list = [labels_1d] if labels_1d is not None else []
-        if batch_1d is not None:
-            cat_list.append(batch_1d)
-
-        h = self.decoder(z, cat_list if len(cat_list) > 0 else None)
-        px_scale = self.px_decoder(h)
-        px_rate = library * px_scale
-        return {'px_rate': px_rate}
+        h = self.decoder_backbone(dec_in)
+        px_scale = self.px_decoder(h)  # [B, n_input]
+        px_rate = library * px_scale   # broadcast
+        return {"px_rate": px_rate}
 
     def forward(self, item, kl_weight=1.0):
-        x = item['X']
-        labels = item['labels']
-        batch_index = item.get('batch', None)
+        x = item["X"]
+        labels = item["labels"]
+        batch_index = item.get("batch", None)
 
-        inference_outputs = self.inference(x, labels, batch_index)
-        generative_outputs = self.generative(
-            inference_outputs['z'],
-            inference_outputs['library'],
-            labels,
-            batch_index
-        )
+        inf = self.inference(x, labels, batch_index)
+        gen = self.generative(inf["z"], inf["library"], labels, batch_index)
 
-        px_rate = torch.clamp(generative_outputs['px_rate'], min=1e-8)
-        qz_m = inference_outputs['qz_m']
-        qz_v = inference_outputs['qz_v']
-
+        px_rate = torch.clamp(gen["px_rate"], min=1e-8)
         reconst_loss = -NegativeBinomial(px_rate, logits=self.px_r).log_prob(x).sum(-1)
 
-        pz = Normal(torch.zeros_like(qz_m), torch.ones_like(qz_m))
-        qz = Normal(qz_m, torch.sqrt(qz_v))
-        kl_divergence_z = kl_divergence(qz, pz).sum(dim=1)
+        # KL(q(z)|p(z))
+        pz = Normal(torch.zeros_like(inf["qz_m"]), torch.ones_like(inf["qz_v"]))
+        qz_d = Normal(inf["qz_m"], torch.sqrt(inf["qz_v"]))
+        kl_local = kl_divergence(qz_d, pz).sum(-1)
 
-        labels_1d = self._to_1d_long(labels)
-        scaling_factor = self.ct_weight[labels_1d]
+        scaling = self.ct_weight[labels.view(-1).long()]
+        loss = torch.mean(scaling * (reconst_loss + kl_weight * kl_local))
 
-        loss = torch.mean(scaling_factor * (reconst_loss + kl_weight * kl_divergence_z))
         return {
-            'loss': loss,
-            'reconstruction_loss': reconst_loss.mean(),
-            'kl_local': kl_divergence_z.mean(),
+            "loss": loss,
+            "reconstruction_loss": reconst_loss.mean(),
+            "kl_local": kl_local.mean(),
         }

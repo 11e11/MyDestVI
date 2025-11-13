@@ -262,9 +262,9 @@ python test_data.py \
   --sc-h5ad ../data/simulation_Mouse_Kidney_MERFISH/MERFISH_kidney_object.h5ad \
   --st-h5ad ../data/simulation_Mouse_Kidney_MERFISH/MK_simulated_ST.h5ad\
   --device cuda \
-  --epochs-sc 20 \
-  --epochs-st 50 \
-  --batch-size 128 \
+  --epochs-sc 300 \
+  --epochs-st 1500 \
+  --batch-size 256 \
   --log-file log2.txt \
   --prop-csv mydestvi_predicted_proportions_mmdAndL1.csv
   模型不收敛
@@ -375,7 +375,7 @@ def main():
     n_input = sc_dataset.X.shape[1]
     n_labels = int(sc_dataset.n_labels)
     log(f"Instantiating CondSCVI: n_input={n_input}, n_labels={n_labels}")
-    cond_model = CondSCVI(n_input=n_input, n_labels=n_labels, n_batch=getattr(sc_dataset, "n_batch", 1))
+    cond_model = CondSCVI(n_input=n_input, n_labels=n_labels, n_batch=getattr(sc_dataset, "n_batch", 0))
     cond_module = getattr(cond_model, "module", cond_model)
     cond_module.to(device)
 
@@ -389,15 +389,31 @@ def main():
         t1 = time.time()
         log(f"[CondSCVI] Epoch {ep+1}/{epochs_sc} avg_loss={avg_loss:.4f} time={t1-t0:.1f}s")
 
-    # 提取解码器权重
-    decoder_state = cond_module.decoder.state_dict() if hasattr(cond_module, "decoder") else None
-    px_decoder_state = cond_module.px_decoder.state_dict() if hasattr(cond_module, "px_decoder") else None
+    decoder_state = None
+    if hasattr(cond_model, "export_decoder_state"):
+        decoder_state = cond_model.export_decoder_state()
 
-    # DestVI 参数
+    if decoder_state is None and hasattr(cond_module, "decoder_backbone"):
+        decoder_state = cond_module.decoder_backbone.state_dict()
+
+    # px_decoder
+    px_decoder_state = None
+    if hasattr(cond_model, "export_px_decoder_state"):
+        px_decoder_state = cond_model.export_px_decoder_state()
+    if px_decoder_state is None and hasattr(cond_module, "px_decoder"):
+        px_decoder_state = cond_module.px_decoder.state_dict()
+
+    # 强校验，避免把 None 继续传下去
+    if not isinstance(decoder_state, dict):
+        raise RuntimeError("decoder_state is None：请确认 CondSCVI 使用固定条件版 VAEC 并已训练，且存在 decoder_backbone")
+    if not isinstance(px_decoder_state, dict):
+        raise RuntimeError("px_decoder_state is None：请确认 CondSCVI.module.px_decoder 存在")
+
+    # ===== 组装 DestVI 参数（与 CondSCVI 结构对齐）=====
     n_spots = int(st_dataset.X.shape[0])
     n_genes = int(st_dataset.X.shape[1])
     n_latent = int(getattr(cond_module, "n_latent", 5))
-    n_hidden = int(cond_module.px_decoder[0].in_features) if hasattr(cond_module, "px_decoder") else 128
+    n_hidden = int(cond_module.px_decoder[0].in_features)  # px_decoder 第一层 in_features = n_hidden
     n_layers_dec = int(getattr(cond_module, "n_layers", 2))
     dropout_dec = float(getattr(cond_module, "dropout_rate", 0.05))
 
@@ -411,15 +427,21 @@ def main():
         decoder_state_dict=decoder_state,
         px_decoder_state_dict=px_decoder_state,
         px_r=(cond_module.px_r.detach().cpu().numpy()
-              if hasattr(cond_module, "px_r") and cond_module.px_r.numel() == n_genes
-              else np.ones(n_genes, dtype=np.float32)),
+            if hasattr(cond_module, "px_r") and cond_module.px_r.numel() == n_genes
+            else np.ones(n_genes, dtype=np.float32)),
         cell_type_mapping=cell_type_mapping,
         dropout_decoder=dropout_dec,
-        # 你设置的正则/MMD
         l1_reg=10.0,
         dirichlet_alpha=0.4,
         dirichlet_mmd_reg=2.0,
     )
+
+    print("sc decoder_backbone first:",
+      next(cond_module.decoder_backbone.net[0].parameters()).shape)   # 预期: (n_hidden, n_latent + n_labels[+ n_batch?])
+
+    # 实例化后（或加载前）:
+    # print("dest MRDeconv decoder first:",
+    #       next(dest_module.decoder.net[0].parameters()).shape)          # 预期第二维相同
 
     log("Instantiating DestVI for ST training")
     destvi_model = DestVI(**destvi_kwargs)
@@ -495,6 +517,11 @@ def main():
         log(f"Warning: could not write updated ST AnnData: {e}")
 
     log("训练完成。")
+    print("has export_decoder_state:", hasattr(cond_model, "export_decoder_state"))
+    print("type(sc_model.module):", type(cond_model.module))
+    print("has decoder_backbone:", hasattr(cond_model.module, "decoder_backbone"))
+    print("has decoder:", hasattr(cond_model.module, "decoder"))
+    print("has px_decoder:", hasattr(cond_model.module, "px_decoder"))
     log_f.close()
 
 

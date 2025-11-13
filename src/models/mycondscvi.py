@@ -105,17 +105,20 @@ class CondSCVI(nn.Module):
         return inference_outputs['qz_m'] if give_mean else inference_outputs['z']
     
     @torch.no_grad()
-    def get_vamp_prior(self, dataloader, p=15, device="cuda"):
+    def get_vamp_prior(self, dataloader, p=15, device='cuda'):
         """
-        计算 VampPrior 参数（用于初始化 DestVI 的 gamma 先验）
+        生成 DestVI 所需的 VampPrior 混合先验参数。
+
         返回:
             mean_vprior: (n_labels, p, n_latent)
             var_vprior:  (n_labels, p, n_latent)
             mp_vprior:   (n_labels, p)
-        说明:
-            - 对每个细胞类型做 KMeans(p) 聚类（若该类型细胞数 < p，则每个细胞单独成簇）
-            - 每个簇的方差 = 平均 posterior var + 该簇 z 均值的样本方差（与 DestVI_SURF 一致）
-            - mp_vprior 为各簇的混合权（簇内样本数 / 该类型总样本数）
+
+        做法（与 DestVI_SURF 对齐）：
+        - 对每个细胞类型的潜在均值 q(z|x).loc 做 KMeans(n_clusters=p, n_init=30)
+          若该类型样本数 < p，则每个细胞各自成为一个簇（或复用到前面簇）
+        - 每个簇的方差 = 该簇 posterior var 的均值 + 均值向量的样本方差
+        - 混合权 mp = 簇样本数 / 该类型总样本数
         """
         from sklearn.cluster import KMeans
         import numpy as np
@@ -124,76 +127,100 @@ class CondSCVI(nn.Module):
         self.eval()
         self.to(device)
 
-        # 收集每个细胞类型的 q(z|x) 的均值与方差
         z_mean_by_label = {i: [] for i in range(self.n_labels)}
         z_var_by_label = {i: [] for i in range(self.n_labels)}
 
+        # 收集所有细胞的 q(z|x) 参数
         for item in dataloader:
             item = {k: v.to(device) for k, v in item.items()}
-            x = item["X"]
-            labels = item["labels"]
-            batch = item.get("batch", None)
-
-            out = self.module.inference(x, labels, batch)
-            qz_m = out["qz_m"]  # [B, D]
-            qz_v = out["qz_v"]  # [B, D]
+            out = self.module.inference(item['X'], item['labels'], item.get('batch', None))
+            qz_m = out['qz_m']
+            qz_v = out['qz_v']
+            labels = item['labels']
 
             for label_idx in range(self.n_labels):
                 mask = (labels == label_idx).view(-1)
                 if mask.any():
-                    z_mean_by_label[label_idx].append(qz_m[mask])  # [b_i, D]
-                    z_var_by_label[label_idx].append(qz_v[mask])   # [b_i, D]
+                    z_mean_by_label[label_idx].append(qz_m[mask])
+                    z_var_by_label[label_idx].append(qz_v[mask])
 
         D = self.n_latent
-        nL = self.n_labels
-        # 预分配输出，未使用的簇槽位将保持默认（mean=0, var=1, mp=0）
-        mean_vprior = np.zeros((nL, p, D), dtype=np.float32)
-        var_vprior = np.ones((nL, p, D), dtype=np.float32)
-        mp_vprior = np.zeros((nL, p), dtype=np.float32)
+        L = self.n_labels
+        mean_vprior = np.zeros((L, p, D), dtype=np.float32)
+        var_vprior = np.ones((L, p, D), dtype=np.float32)
+        mp_vprior = np.zeros((L, p), dtype=np.float32)
 
-        for label_idx in range(nL):
+        for label_idx in range(L):
             if len(z_mean_by_label[label_idx]) == 0:
                 continue
+
             z_m = torch.cat(z_mean_by_label[label_idx], dim=0)  # [N_l, D]
             z_v = torch.cat(z_var_by_label[label_idx], dim=0)   # [N_l, D]
             N_l = z_m.size(0)
-            if N_l == 0:
-                continue
 
-            if p > 0 and N_l > p:
-                # 按 z 的均值做 KMeans 聚类（与 SURF 对齐：n_init=30）
+            if N_l > p and p > 0:
                 km = KMeans(n_clusters=p, n_init=30, random_state=0)
-                labels_k = torch.as_tensor(km.fit_predict(z_m.detach().cpu().numpy()), device=z_m.device)
-                keys, counts = torch.unique(labels_k, return_counts=True)
-                n_clusters = keys.numel()
+                cluster_ids = torch.as_tensor(km.fit_predict(z_m.detach().cpu().numpy()), device=z_m.device)
+                keys, counts = torch.unique(cluster_ids, return_counts=True)
             else:
-                # 每个细胞单独作为一个簇（最多填满到 p 个槽位）
+                # 将每个样本作为一个簇或循环映射到 p 个槽位
                 n_clusters = min(p if p > 0 else N_l, N_l)
-                labels_k = torch.arange(n_clusters, device=z_m.device).repeat_interleave(1)
-                if labels_k.numel() < N_l:
-                    # 剩余样本直接映射到已有簇（简单循环）
-                    extra = N_l - labels_k.numel()
-                    extra_assign = torch.arange(extra, device=z_m.device) % n_clusters
-                    labels_k = torch.cat([labels_k, extra_assign], dim=0)
-                keys = torch.arange(n_clusters, device=z_m.device)
-                counts = torch.tensor([torch.sum(labels_k == k).item() for k in keys], device=z_m.device)
+                base = torch.arange(n_clusters, device=z_m.device)
+                if N_l > n_clusters:
+                    extra = (torch.arange(N_l - n_clusters, device=z_m.device) % n_clusters)
+                    cluster_ids = torch.cat([base, extra], dim=0)
+                else:
+                    cluster_ids = base
+                keys, counts = torch.unique(cluster_ids, return_counts=True)
 
-            # 为该 label 的每个簇计算 mean/var 和混合权
             for local_idx, k in enumerate(keys.tolist()):
-                idx = (labels_k == k)
-                z_m_k = z_m[idx]  # [n_k, D]
-                z_v_k = z_v[idx]  # [n_k, D]
-                if z_m_k.size(0) == 0:
+                if local_idx >= p:
+                    break
+                mask = (cluster_ids == k)
+                z_m_k = z_m[mask]
+                z_v_k = z_v[mask]
+                n_k = z_m_k.size(0)
+                if n_k == 0:
                     continue
-
                 # 簇均值
-                mean_cluster = z_m_k.mean(dim=0)  # [D]
-                # 方差 = 平均 posterior var + 簇内均值的样本方差（与 SURF 一致）
-                var_cluster = z_v_k.mean(dim=0) + z_m_k.var(dim=0, unbiased=False)  # [D]
+                mean_cluster = z_m_k.mean(dim=0)
+                # 簇方差 = 平均 posterior 方差 + 均值向量样本方差
+                var_cluster = z_v_k.mean(dim=0) + z_m_k.var(dim=0, unbiased=False)
 
-                if local_idx < p:
-                    mean_vprior[label_idx, local_idx, :] = mean_cluster.detach().cpu().numpy()
-                    var_vprior[label_idx, local_idx, :] = var_cluster.detach().cpu().numpy()
-                    mp_vprior[label_idx, local_idx] = counts[local_idx].item() / float(N_l)
+                mean_vprior[label_idx, local_idx, :] = mean_cluster.detach().cpu().numpy()
+                var_vprior[label_idx, local_idx, :] = var_cluster.detach().cpu().numpy()
+                mp_vprior[label_idx, local_idx] = float(n_k) / float(N_l)
 
         return mean_vprior, var_vprior, mp_vprior
+    
+    def export_decoder_state(self):
+        """
+        返回 decoder_backbone（固定条件版解码器）的 state_dict；
+        若不存在则回退到 decoder（兼容旧命名）。
+        """
+        m = getattr(self, "module", None)
+        if m is None:
+            return None
+        dec = getattr(m, "decoder_backbone", None)
+        if dec is None:
+            dec = getattr(m, "decoder", None)
+        return dec.state_dict() if dec is not None else None
+
+    def export_px_decoder_state(self):
+        m = getattr(self, "module", None)
+        if m is None:
+            return None
+        px = getattr(m, "px_decoder", None)
+        return px.state_dict() if px is not None else None
+
+    def export_px_r(self):
+        m = getattr(self, "module", None)
+        if m is None:
+            return None
+        return m.px_r.detach().cpu().numpy()
+
+    def export_dropout_decoder(self):
+        m = getattr(self, "module", None)
+        if m is None:
+            return 0.05
+        return getattr(m, "dropout_rate", 0.05)
