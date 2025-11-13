@@ -1,7 +1,6 @@
-# from .models.destvi import DestVI
-# from .modules.mrdeconv import MRDeconv
-# from .modules.vaec import VAEC          # 如果有 vaec.py
-# from .models.condscvi import CondSCVI  # 如果有 condscvi.py
-
-
-# __all__ = ["DestVI", "MRDeconv", "CondSCVI", "VAEC"]
+"""
+src 包初始化尽量保持最小，不要在这里导入下级包（尤其是 models），
+以避免在 import 子模块时触发不必要的循环导入。
+"""
+# 保持为空或仅放置注释/版本信息等
+__all__ = []
