@@ -69,6 +69,7 @@ def train_one_epoch_st(module: torch.nn.Module,
                        dataloader: DataLoader,
                        optimizer,
                        device: torch.device,
+                       n_obs:int,
                        start_step: int,
                        warmup_steps_kl: int,
                        warmup_steps_reg: int) -> tuple[dict, int]:
@@ -83,7 +84,7 @@ def train_one_epoch_st(module: torch.nn.Module,
         item = move_item_to_device(item, device)
         kl_w = linear_warmup(step, warmup_steps_kl)
         reg_w = linear_warmup(step, warmup_steps_reg)
-        out = module.forward(item, kl_weight=kl_w, reg_warmup=reg_w, n_obs=1.0)  # 关键：传入 kl_weight / reg_warmup
+        out = module.forward(item, kl_weight=kl_w, reg_warmup=reg_w, n_obs=n_obs)  # 关键：传入 kl_weight / reg_warmup
         loss = out["loss"]
         loss_val = loss if loss.dim() == 0 else loss.mean()
         optimizer.zero_grad()
@@ -252,7 +253,7 @@ def main():
     for ep in range(epochs_st):
         t0 = time.time()
         avg_loss_dict, step_st = train_one_epoch_st(
-            dest_module, st_loader, st_opt, device, step_st, warmup_steps_kl_st, warmup_steps_reg_st
+            dest_module, st_loader, st_opt, device, step_st, warmup_steps_kl_st, warmup_steps_reg_st, st_dataset.X.shape[0]
         )
         t1 = time.time()
         main_loss = avg_loss_dict.get("loss", 0.0)

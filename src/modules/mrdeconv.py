@@ -571,52 +571,6 @@ class MRDeconv(BaseModuleClass):
             h2 = F.elu(h2)
             v_raw_all = self.V_gat_linear(h2)                             # [N, n_labels+1]
             v_ind = v_raw_all[ind_x, :]                                   # [m, n_labels+1]
-        
-        # if self.use_gat:
-        #     edge_index = self._edge_index
-        #     # edge_weight = getattr(self, '_edge_weight', None)  # GIN 不用权重
-
-        #     if edge_index.numel() == 0:
-        #         raise RuntimeError("use_gat=True 需要先调用 attach_graph(...) 注册 edge_index")
-        #     if not hasattr(self, "_X_all"):
-        #         raise RuntimeError("use_gat=True 需要先调用 attach_full_X(adata) 缓存全量 X")
-
-        #     # X_all = self._X_all.to(x.device, dtype=torch.float32)
-        #     # X_all_log = torch.log1p(X_all)
-
-        #     # # gamma 分支（GINConv 不接受 edge_weight）
-        #     # h = X_all_log
-        #     # layer = self.gamma_gat_layers[0]
-        #     # h = F.elu(layer(h, edge_index))
-        #     # gamma_raw_all = self.gamma_gat_linear(h)
-        #     # gamma_mb = gamma_raw_all[ind_x, :]
-        #     # gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent).permute(2, 1, 0)
-
-        #     # # V 分支
-        #     # h2 = X_all_log
-        #     # layer = self.V_gat_layers[0]
-        #     # h2 = F.elu(layer(h2, edge_index))
-        #     # v_raw_all = self.V_gat_linear(h2)
-        #     # v_ind = v_raw_all[ind_x, :]
-        #     # 3) 前向：把 edge_weight 当作 edge_attr 传进去（形状 [E,1]）
-        #     # ...existing code...
-        #     X_all = self._X_all.to(x.device, dtype=torch.float32).clamp_min(0)
-        #     X_all_log = torch.log1p(X_all)
-        #     edge_index = self._edge_index
-        #     edge_attr = getattr(self, "_edge_weight", None)
-        #     edge_attr = edge_attr.unsqueeze(-1) if edge_attr is not None and edge_attr.numel() > 0 else None
-
-        #     # gamma 分支
-        #     h = self.gamma_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
-        #     h = self.gamma_ln(h)
-        #     h = F.elu(h)
-        #     gamma_raw_all = self.gamma_gat_linear(h)
-        #     # V 分支
-        #     h2 = self.V_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
-        #     h2 = self.V_ln(h2)
-        #     h2 = F.elu(h2)
-        #     v_raw_all = self.V_gat_linear(h2)
-
         else:
             # 原来的 FC 分支保持不变
             if self.amortization in ["both", "latent"]:
