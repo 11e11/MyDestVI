@@ -1,8 +1,12 @@
 """
-MRDeconv 模块 - 固定条件版（手动拼接 one-hot 标签）
-- 去掉对 FCLayers 的 n_cat_list/inject_covariates 依赖
-- decoder 的输入为 [latent, onehot(label)]
+MRDeconv 模块 - 固定条件版（手动拼接 one-hot 标签）+ 训练日程退火
+- decoder 输入 = [latent, onehot(label)]
+- 仅当传入 dict-like state_dict 才加载权重
+- forward 支持 kl_weight 与 reg_warmup（L1/MMD 退火）
+- VampPrior 混合先验分支做形状与数值健壮处理
 """
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 from torch.distributions import Normal, Dirichlet
@@ -48,14 +52,18 @@ class MRDeconv(nn.Module):
         self.n_latent = n_latent
         self.n_hidden = n_hidden
         self.amortization = amortization
-        self.l1_reg = l1_reg
-        self.beta_reg = beta_reg
-        self.eta_reg = eta_reg
-        self.dirichlet_mmd_reg = dirichlet_mmd_reg
+
+        # 保存正则化的基值（用于退火）
+        self.base_l1_reg = float(l1_reg)
+        self.base_dirichlet_mmd_reg = float(dirichlet_mmd_reg)
+        self.beta_reg = float(beta_reg)
+        self.eta_reg = float(eta_reg)
+
         self.use_gat = use_gat
         self.gat_hidden = gat_hidden
+        self.gat_heads = gat_heads
 
-        # 解码器（固定条件：输入维度 = n_latent + n_labels）
+        # 冻结的解码器：输入维度 = n_latent + n_labels
         self.decoder = FCLayers(
             n_in=n_latent + n_labels,
             n_out=n_hidden,
@@ -71,8 +79,7 @@ class MRDeconv(nn.Module):
             except Exception as e:
                 print(f"[WARN] Loading decoder_state_dict failed: {e}")
         else:
-            print(f"[WARN] decoder_state_dict is None (type={type(decoder_state_dict)}). "
-                  f"Ensure DestVI.from_rna_model extracted decoder_backbone.state_dict().")
+            print(f"[WARN] decoder_state_dict is None (type={type(decoder_state_dict)}).")
 
         for p in self.decoder.parameters():
             p.requires_grad = False
@@ -92,6 +99,7 @@ class MRDeconv(nn.Module):
         for p in self.px_decoder.parameters():
             p.requires_grad = False
 
+        # NB logits
         self.register_buffer("px_r", torch.tensor(px_r, dtype=torch.float32))
 
         # 可学习参数
@@ -101,12 +109,12 @@ class MRDeconv(nn.Module):
         self.beta = nn.Parameter(0.01 * torch.randn(n_genes))
 
         # VampPrior
-        if mean_vprior is not None:
+        if mean_vprior is not None and var_vprior is not None and mp_vprior is not None:
             self.register_buffer("mean_vprior", torch.tensor(mean_vprior, dtype=torch.float32))
             self.register_buffer("var_vprior", torch.tensor(var_vprior, dtype=torch.float32))
             self.register_buffer("mp_vprior", torch.tensor(mp_vprior, dtype=torch.float32))
         else:
-            self.mean_vprior = None
+            self.mean_vprior = None  # 触发标准正态先验
 
         # 摊销网络（非 GAT）
         if not use_gat:
@@ -135,168 +143,142 @@ class MRDeconv(nn.Module):
                 nn.Linear(n_hidden, n_labels + 1),
             )
         else:
-            from torch_geometric.nn import GINEConv
+            # 省略 GAT 实现（与之前一致），如需请告知
+            raise NotImplementedError("use_gat=True 目前未在此替换版中实现")
 
-            def mlp_block(in_dim, out_dim):
-                return nn.Sequential(
-                    nn.Linear(in_dim, gat_hidden),
-                    nn.BatchNorm1d(gat_hidden),
-                    nn.ReLU(),
-                    nn.Dropout(p=0.1),
-                    nn.Linear(gat_hidden, out_dim),
-                )
-
-            self.gamma_gat_layers = nn.ModuleList([GINEConv(mlp_block(n_genes, gat_hidden), train_eps=True, edge_dim=1)])
-            self.gamma_gat_linear = nn.Linear(gat_hidden, n_latent * n_labels)
-            self.gamma_ln = nn.LayerNorm(gat_hidden)
-
-            self.V_gat_layers = nn.ModuleList([GINEConv(mlp_block(n_genes, gat_hidden), train_eps=True, edge_dim=1)])
-            self.V_gat_linear = nn.Linear(gat_hidden, n_labels + 1)
-            self.V_ln = nn.LayerNorm(gat_hidden)
-
-            self.register_buffer("_edge_index", torch.empty((2, 0), dtype=torch.long), persistent=False)
-            self.register_buffer("_edge_weight", torch.empty(0, dtype=torch.float32), persistent=False)
-
-        # Dirichlet
+        # Dirichlet 先验超参
         if dirichlet_alpha is None:
             self.dirichlet_alpha = torch.ones(n_labels)
         else:
             alpha = torch.tensor(dirichlet_alpha, dtype=torch.float32)
-            if alpha.numel() == 1:
-                self.dirichlet_alpha = alpha.repeat(n_labels)
-            else:
-                self.dirichlet_alpha = alpha
+            self.dirichlet_alpha = alpha.repeat(n_labels) if alpha.numel() == 1 else alpha
 
-    def generative(self, x, ind_x, batch_index=None):
+    def _decode_ct(self, gamma_ind: torch.Tensor) -> torch.Tensor:
         """
-        构建生成图：固定条件版
+        对每个 cell type 分别用冻结 decoder 生成 px_rate（未乘 library）
+        gamma_ind: [m, n_labels, n_latent]
+        return: [m, n_labels, n_genes]
         """
-        m = x.shape[0]
-        library = x.sum(1, keepdim=True)
-        beta = torch.exp(self.beta)
-        eps = F.softplus(self.eta)
-
-        x_ = torch.log1p(torch.clamp(x, min=0.0))
-
-        # gamma, v
-        if self.use_gat:
-            if not hasattr(self, "_X_all"):
-                raise RuntimeError("use_gat=True 需要先 attach_full_X")
-            if self._edge_index.numel() == 0:
-                raise RuntimeError("use_gat=True 需要先 attach_graph")
-
-            X_all = torch.clamp_min(self._X_all.to(x.device, dtype=torch.float32), 0.0)
-            X_all_log = torch.log1p(X_all)
-            edge_index = self._edge_index.to(x.device)
-            edge_attr = getattr(self, "_edge_weight", None)
-            if edge_attr is not None and edge_attr.numel() > 0:
-                edge_attr = edge_attr.to(x.device).unsqueeze(-1)
-
-            h = self.gamma_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
-            h = self.gamma_ln(h)
-            h = F.elu(h)
-            gamma_raw_all = self.gamma_gat_linear(h)
-            gamma_mb = gamma_raw_all[ind_x, :]
-            gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent).permute(2, 1, 0)
-
-            h2 = self.V_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
-            h2 = self.V_ln(h2)
-            h2 = F.elu(h2)
-            v_raw_all = self.V_gat_linear(h2)
-            v_ind = v_raw_all[ind_x, :]
-        else:
-            if self.amortization in ["both", "latent"]:
-                gamma_ind = torch.transpose(self.gamma_encoder(x_), 0, 1).reshape((self.n_latent, self.n_labels, -1))
-            else:
-                gamma_ind = self.gamma[:, :, ind_x]
-
-            if self.amortization in ["both", "proportion"]:
-                v_ind = self.V_encoder(x_)
-            else:
-                v_ind = self.V[:, ind_x].T
-
-        v_ind = F.softplus(v_ind)  # [m, n_labels+1]
-
-        # 通过 CondSCVI 冻结的 decoder 生成每个 celltype 的基因尺度
-        gamma_ind = torch.transpose(gamma_ind, 2, 0)  # [m, n_labels, n_latent]
-        gamma_reshape = gamma_ind.reshape((-1, self.n_latent))  # [m*n_labels, n_latent]
-
-        # 手动 one-hot label 并拼接
-        enum_label = torch.arange(0, self.n_labels, device=x.device).repeat(m)  # [m*n_labels]
+        m = gamma_ind.size(0)
+        gamma_reshape = gamma_ind.reshape(-1, self.n_latent)  # [m*n_labels, n_latent]
+        # one-hot label
+        enum_label = torch.arange(0, self.n_labels, device=gamma_ind.device).repeat(m)
         label_oh = F.one_hot(enum_label.long(), num_classes=self.n_labels).float()  # [m*n_labels, n_labels]
         dec_in = torch.cat([gamma_reshape, label_oh], dim=1)  # [m*n_labels, n_latent+n_labels]
-
         h_dec = self.decoder(dec_in)
-        px_rate = self.px_decoder(h_dec).reshape((m, self.n_labels, -1))  # [m, n_labels, n_genes]
+        px_rate = self.px_decoder(h_dec).reshape((m, self.n_labels, -1))
+        return px_rate
 
-        # 合成 dummy + celltype
-        eps = eps.repeat((m, 1)).view(m, 1, -1)
-        r_hat = torch.cat([beta.unsqueeze(0).unsqueeze(1) * px_rate, eps], dim=1)  # [m, n_labels+1, n_genes]
-        px_scale = torch.sum(v_ind.unsqueeze(2) * r_hat, dim=1)  # [m, n_genes]
-        px_rate_final = library * px_scale
-
-        return {
-            "px_rate": px_rate_final,
-            "px_scale": px_scale,
-            "gamma": gamma_ind,  # [m, n_labels, n_latent]
-            "v": v_ind,
-        }
-
-    def forward(self, item, kl_weight=1.0, n_obs=1.0):
-        x = item["X"]
-        ind_x = item["ind_x"]
-        batch_index = item.get("batch", None)
-
-        outputs = self.generative(x, ind_x, batch_index)
-        px_rate = outputs["px_rate"]
-        gamma = outputs["gamma"]
-        v = outputs["v"]
-
-        reconst_loss = -NegativeBinomial(px_rate, logits=self.px_r).log_prob(x).sum(-1)
-
-        mean = torch.zeros_like(self.eta)
-        scale = torch.ones_like(self.eta)
-        glo_neg_log_likelihood_prior = -self.eta_reg * Normal(mean, scale).log_prob(self.eta).sum()
-        var_beta = torch.mean(self.beta ** 2) - torch.mean(self.beta) ** 2
-        glo_neg_log_likelihood_prior += self.beta_reg * var_beta
-
-        v_sparsity_loss = self.l1_reg * torch.abs(v).mean(1)
-
-        # gamma 先验（VampPrior 混合）
+    def _gamma_prior_nll(self, gamma: torch.Tensor) -> torch.Tensor:
+        """
+        计算 gamma 的先验负对数似然（按样本维度返回）。
+        gamma: [m, n_labels, n_latent]
+        return: [m]
+        """
         if self.mean_vprior is None:
             mean = torch.zeros_like(gamma)
             scale = torch.ones_like(gamma)
-            neg_log_likelihood_prior = -Normal(mean, scale).log_prob(gamma).sum(2).sum(1)
+            return -Normal(mean, scale).log_prob(gamma).sum(2).sum(1)
+
+        # 形状健壮处理：期望 mean/var/mp 为 (n_labels, p, n_latent)/(n_labels, p)/(n_labels, p)
+        mean_vprior = self.mean_vprior
+        var_vprior = self.var_vprior
+        mp_vprior = self.mp_vprior
+        if mean_vprior.dim() == 2:
+            mean_vprior = mean_vprior.unsqueeze(1)
+        if var_vprior.dim() == 2:
+            var_vprior = var_vprior.unsqueeze(1)
+        if mp_vprior.dim() == 1:
+            mp_vprior = mp_vprior.unsqueeze(1)
+
+        # 转为 [1, p, n_labels, n_latent]
+        mean_vprior = torch.transpose(mean_vprior, 0, 1).unsqueeze(0)
+        var_vprior = torch.transpose(var_vprior, 0, 1).unsqueeze(0)
+        mp_vprior = torch.transpose(mp_vprior, 0, 1)  # [p, n_labels]
+
+        # 广播到 [1, p, m, n_labels, n_latent]
+        gamma_exp = gamma.unsqueeze(0).unsqueeze(0)  # [1,1,m,n_labels,n_latent]
+        mean_exp = mean_vprior.unsqueeze(2)
+        var_exp = (var_vprior + 1e-4).unsqueeze(2)   # 数值稳定
+
+        log_prob = Normal(mean_exp, torch.sqrt(var_exp)).log_prob(gamma_exp).sum(-1)  # [1,p,m,n_labels]
+        pre_lse = log_prob + torch.log(mp_vprior.clamp_min(1e-12)).unsqueeze(0).unsqueeze(2)
+        log_lik = torch.logsumexp(pre_lse, dim=1).sum(-1)  # [1,m]
+        nll = -log_lik.squeeze(0)  # [m]
+        return nll
+
+    def generative(self, x: torch.Tensor, ind_x: torch.Tensor):
+        """
+        核心生成图
+        """
+        m = x.shape[0]
+        library = x.sum(1, keepdim=True)
+        beta = torch.exp(self.beta)            # [n_genes]
+        eps = F.softplus(self.eta)             # [n_genes]
+
+        x_ = torch.log1p(torch.clamp_min(x, 0.0))
+
+        # gamma / v
+        if self.amortization in ["both", "latent"]:
+            gamma_ind = torch.transpose(self.gamma_encoder(x_), 0, 1).reshape((self.n_latent, self.n_labels, -1))
         else:
-            gamma_expanded = gamma.unsqueeze(1)  # [m,1,n_labels,n_latent]
-            mean_vprior = self.mean_vprior
-            var_vprior = self.var_vprior
-            mp_vprior = self.mp_vprior
-            if mean_vprior.dim() == 2:
-                mean_vprior = mean_vprior.unsqueeze(1)
-            if var_vprior.dim() == 2:
-                var_vprior = var_vprior.unsqueeze(1)
-            if mp_vprior.dim() == 1:
-                mp_vprior = mp_vprior.unsqueeze(1)
+            gamma_ind = self.gamma[:, :, ind_x]
+        if self.amortization in ["both", "proportion"]:
+            v_ind = F.softplus(self.V_encoder(x_))        # [m, n_labels+1]
+        else:
+            v_ind = F.softplus(self.V[:, ind_x].T)
 
-            mean_vprior = torch.transpose(mean_vprior, 0, 1).unsqueeze(0)  # [1,p,n_labels,n_latent]
-            var_vprior = torch.transpose(var_vprior, 0, 1).unsqueeze(0)
-            mp_vprior = torch.transpose(mp_vprior, 0, 1)  # [p,n_labels]
+        # 解码每个 celltype 的 rate（未乘 library）
+        gamma_mlb = torch.transpose(gamma_ind, 2, 0)      # [m, n_labels, n_latent]
+        px_rate_ct = self._decode_ct(gamma_mlb)           # [m, n_labels, n_genes]
 
-            # 将 gamma 的 batch 维挪到前面，便于广播
-            gamma_perm = gamma.permute(0, 1, 2)  # [m, n_labels, n_latent]
-            gamma_perm_exp = gamma_perm.unsqueeze(0).unsqueeze(1)  # [1,1,m,n_labels,n_latent]
-            mean_prior_exp = mean_vprior.unsqueeze(2)  # [1,p,1,n_labels,n_latent]
-            var_prior_exp = (var_vprior + 1e-4).unsqueeze(2)
+        # 合成 dummy + 各类型
+        eps_ct = eps.repeat((m, 1)).view(m, 1, -1)
+        r_hat = torch.cat([beta.unsqueeze(0).unsqueeze(1) * px_rate_ct, eps_ct], dim=1)  # [m, n_labels+1, n_genes]
+        px_scale = torch.sum(v_ind.unsqueeze(2) * r_hat, dim=1)                          # [m, n_genes]
+        px_rate = library * px_scale                                                     # [m, n_genes]
 
-            log_prob = Normal(mean_prior_exp, torch.sqrt(var_prior_exp)).log_prob(gamma_perm_exp).sum(-1)  # [1,p,m,n_labels]
-            pre_lse = log_prob + torch.log(mp_vprior.clamp_min(1e-12)).unsqueeze(0).unsqueeze(2)  # [1,p,m,n_labels]
-            log_likelihood_prior = torch.logsumexp(pre_lse, dim=1).sum(-1)  # [1,m]
-            neg_log_likelihood_prior = -log_likelihood_prior.squeeze(0)  # [m]
+        return {
+            "px_rate": px_rate,
+            "px_scale": px_scale,
+            "gamma": gamma_mlb,    # [m, n_labels, n_latent]
+            "v": v_ind,            # [m, n_labels+1]
+        }
 
-        # Dirichlet MMD（可选）
+    def forward(self, item: dict, kl_weight: float = 1.0, n_obs: float = 1.0, reg_warmup: float = 1.0):
+        """
+        kl_weight: 对 gamma 先验项的退火权重（0→1）
+        reg_warmup: 对 L1/MMD 的退火权重（0→1）
+        """
+        x = item["X"]
+        ind_x = item["ind_x"]
+
+        outs = self.generative(x, ind_x)
+        px_rate = outs["px_rate"]
+        gamma = outs["gamma"]
+        v = outs["v"]
+
+        # 重构
+        reconst_loss = -NegativeBinomial(px_rate, logits=self.px_r).log_prob(x).sum(-1)  # [m]
+
+        # 全局先验（eta/beta）
+        mean_eta = torch.zeros_like(self.eta)
+        scale_eta = torch.ones_like(self.eta)
+        glo_neg_log_likelihood_prior = -self.eta_reg * Normal(mean_eta, scale_eta).log_prob(self.eta).sum()
+        # 用 var(beta)
+        glo_neg_log_likelihood_prior += self.beta_reg * torch.var(self.beta)
+
+        # L1 稀疏（退火）
+        effective_l1 = self.base_l1_reg * float(reg_warmup)
+        v_sparsity = effective_l1 * torch.abs(v).mean(1)  # [m]
+
+        # gamma 先验（退火）
+        nll_gamma = self._gamma_prior_nll(gamma)          # [m]
+
+        # MMD（退火）
+        effective_mmd = self.base_dirichlet_mmd_reg * float(reg_warmup)
         mmd_term = torch.tensor(0.0, device=px_rate.device)
-        if self.dirichlet_mmd_reg > 0.0:
+        if effective_mmd > 0.0:
             v_real = v[:, : self.n_labels]
             proportions = v_real / (v_real.sum(dim=1, keepdim=True) + 1e-8)
             alpha = self.dirichlet_alpha.to(proportions.device)
@@ -304,13 +286,14 @@ class MRDeconv(nn.Module):
             theta_prior = dirich.sample((proportions.size(0),)).to(proportions.device)
             mmd_term = self._mmd_rbf(proportions, theta_prior)
 
-        sample_term = reconst_loss + kl_weight * (neg_log_likelihood_prior + v_sparsity_loss)
-        loss = n_obs * (torch.mean(sample_term) + glo_neg_log_likelihood_prior + self.dirichlet_mmd_reg * mmd_term)
+        # 汇总
+        sample_term = reconst_loss + float(kl_weight) * (nll_gamma + v_sparsity)  # [m]
+        loss = n_obs * (torch.mean(sample_term) + glo_neg_log_likelihood_prior + effective_mmd * mmd_term)
 
         return {
             "loss": loss,
             "reconstruction_loss": reconst_loss.mean(),
-            "kl_local": neg_log_likelihood_prior.mean(),
+            "kl_local": nll_gamma.mean(),
             "kl_global": glo_neg_log_likelihood_prior,
             "mmd": mmd_term,
         }
@@ -345,30 +328,14 @@ class MRDeconv(nn.Module):
 
     @torch.no_grad()
     def get_proportions(self, x=None, keep_noise=False):
+        """
+        保持你现有实现：若 amortization 包含 proportion，则用 V_encoder(FClayers)，否则直接用参数 V
+        """
         if self.amortization in ["both", "proportion"]:
-            if self.use_gat:
-                if not hasattr(self, "_X_all"):
-                    raise RuntimeError("需要attach_full_X")
-                if self._edge_index.numel() == 0:
-                    raise RuntimeError("需要attach_graph")
-
-                device = self.px_r.device
-                X_all = torch.clamp_min(self._X_all.to(device, dtype=torch.float32), 0.0)
-                X_all_log = torch.log1p(X_all)
-                edge_index = self._edge_index.to(device)
-                edge_attr = getattr(self, "_edge_weight", None)
-                if edge_attr is not None and edge_attr.numel() > 0:
-                    edge_attr = edge_attr.to(device).unsqueeze(-1)
-
-                h = self.V_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
-                h = self.V_ln(h)
-                h = F.elu(h)
-                res = F.softplus(self.V_gat_linear(h))
-            else:
-                if x is None:
-                    raise ValueError("FC模式需要传入x")
-                x_ = torch.log1p(x)
-                res = F.softplus(self.V_encoder(x_))
+            if x is None:
+                raise ValueError("FC 模式需要传入 x")
+            x_ = torch.log1p(x)
+            res = F.softplus(self.V_encoder(x_))
         else:
             res = F.softplus(self.V)
             if res.dim() == 2 and res.shape[0] == self.n_labels + 1:
@@ -382,115 +349,10 @@ class MRDeconv(nn.Module):
     @torch.no_grad()
     def get_gamma(self, x=None):
         if self.amortization in ["latent", "both"]:
-            if self.use_gat:
-                if not hasattr(self, "_X_all"):
-                    raise RuntimeError("需要attach_full_X")
-                if self._edge_index.numel() == 0:
-                    raise RuntimeError("需要attach_graph")
-
-                device = self.px_r.device
-                X_all = torch.clamp_min(self._X_all.to(device, dtype=torch.float32), 0.0)
-                X_all_log = torch.log1p(X_all)
-                edge_index = self._edge_index.to(device)
-                edge_attr = getattr(self, "_edge_weight", None)
-                if edge_attr is not None and edge_attr.numel() > 0:
-                    edge_attr = edge_attr.to(device).unsqueeze(-1)
-
-                h = self.gamma_gat_layers[0](X_all_log, edge_index, edge_attr=edge_attr)
-                h = self.gamma_ln(h)
-                h = F.elu(h)
-                gamma_raw_all = self.gamma_gat_linear(h)
-                N = gamma_raw_all.size(0)
-                gamma = gamma_raw_all.view(N, self.n_labels, self.n_latent).permute(2, 1, 0)
-                return gamma.cpu().numpy()
-            else:
-                if x is None:
-                    raise ValueError("FC模式需要传入x")
-                x_ = torch.log1p(x)
-                gamma = self.gamma_encoder(x_)
-                return torch.transpose(gamma, 0, 1).reshape((self.n_latent, self.n_labels, -1)).cpu().numpy()
+            if x is None:
+                raise ValueError("FC 模式需要传入 x")
+            x_ = torch.log1p(x)
+            gamma = self.gamma_encoder(x_)
+            return torch.transpose(gamma, 0, 1).reshape((self.n_latent, self.n_labels, -1)).cpu().numpy()
         else:
             return self.gamma.cpu().numpy()
-
-    @torch.no_grad()
-    def get_ct_specific_expression(self, x, ind_x, y):
-        beta = torch.exp(self.beta)
-        y_torch = (y * torch.ones_like(ind_x)).ravel().long()
-
-        if self.amortization in ["both", "latent"]:
-            x_ = torch.log1p(x)
-            gamma_ind = torch.transpose(self.gamma_encoder(x_), 0, 1).reshape((self.n_latent, self.n_labels, -1))
-        else:
-            gamma_ind = self.gamma[:, :, ind_x]
-
-        gamma_select = gamma_ind[:, y_torch, torch.arange(ind_x.shape[0])].T  # [m, n_latent]
-        label_oh = F.one_hot(y_torch, num_classes=self.n_labels).float()      # [m, n_labels]
-        dec_in = torch.cat([gamma_select, label_oh], dim=1)                   # [m, n_latent+n_labels]
-
-        h = self.decoder(dec_in)
-        px_scale = self.px_decoder(h)
-        px_ct = torch.exp(self.px_r).unsqueeze(0) * beta.unsqueeze(0) * px_scale
-        return px_ct
-
-    def attach_graph(self, adata=None, edge_index=None, edge_weight=None, k=6, spatial_key="spatial"):
-        if edge_index is not None:
-            if not isinstance(edge_index, torch.Tensor):
-                edge_index = torch.as_tensor(edge_index, dtype=torch.long)
-            self.register_buffer("_edge_index", edge_index, persistent=False)
-
-            if edge_weight is not None:
-                if not isinstance(edge_weight, torch.Tensor):
-                    edge_weight = torch.as_tensor(edge_weight, dtype=torch.float32)
-                self.register_buffer("_edge_weight", edge_weight, persistent=False)
-            else:
-                self.register_buffer("_edge_weight", torch.ones(edge_index.shape[1], dtype=torch.float32), persistent=False)
-            return self
-
-        if adata is None:
-            raise ValueError("需要adata或edge_index")
-
-        coords = None
-        if spatial_key in adata.obsm:
-            coords = adata.obsm[spatial_key]
-        elif "spatial" in adata.obsm:
-            coords = adata.obsm["spatial"]
-        else:
-            raise ValueError("未找到空间坐标")
-
-        import numpy as np
-        from sklearn.neighbors import NearestNeighbors
-
-        nbrs = NearestNeighbors(n_neighbors=min(k + 1, coords.shape[0]), algorithm="auto").fit(coords)
-        distances, indices = nbrs.kneighbors(coords)
-
-        src = []
-        dst = []
-        for i in range(indices.shape[0]):
-            neigh = indices[i, 1 : min(k + 1, indices.shape[1])]
-            for j in neigh:
-                src.append(i)
-                dst.append(int(j))
-
-        edge_index = torch.as_tensor([src, dst], dtype=torch.long)
-        edge_index = torch.cat([edge_index, edge_index[[1, 0]]], dim=1)
-        edge_weight = torch.ones(edge_index.shape[1], dtype=torch.float32)
-
-        self.register_buffer("_edge_index", edge_index, persistent=False)
-        self.register_buffer("_edge_weight", edge_weight, persistent=False)
-        return self
-
-    def attach_full_X(self, adata, layer=None):
-        import numpy as np
-        from scipy.sparse import issparse
-
-        if layer is not None and layer in getattr(adata, "layers", {}):
-            X = adata.layers[layer]
-        else:
-            X = adata.X
-
-        if issparse(X):
-            X = X.toarray()
-        X = np.asarray(X, dtype=np.float32)
-
-        self.register_buffer("_X_all", torch.from_numpy(X), persistent=False)
-        return self

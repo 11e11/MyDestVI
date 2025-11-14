@@ -1,245 +1,3 @@
-# from __future__ import annotations
-
-# import argparse
-# from collections import defaultdict
-# import os
-# import time
-# import importlib
-# import traceback
-# from typing import Optional, Tuple
-
-# import numpy as np
-# import pandas as pd
-# from pandas.api.types import CategoricalDtype
-# import scanpy as sc
-# import torch
-# from torch.utils.data import DataLoader
-
-# # 引入你写的 Dataset
-# from src.data import SingleCellDataset, SpatialDataset
-# from src.models.mycondscvi import CondSCVI
-# from src.models.mydestvi import DestVI
-# # from src.models import CondSCVI, DestVI
-
-
-# def move_item_to_device(item: dict, device: torch.device) -> dict:
-#     out = {}
-#     for k, v in item.items():
-#         if torch.is_tensor(v):
-#             out[k] = v.to(device)
-#         else:
-#             out[k] = v
-#     return out
-
-
-# def train_one_epoch_sc(module: torch.nn.Module, dataloader: DataLoader, optimizer, device, verbose=True) -> float:
-#     module.train()
-#     total_loss = 0.0
-#     n_batches = 0
-#     for i, item in enumerate(dataloader, 1):
-#         item = move_item_to_device(item, device)  # item = {'X': [B,G], 'labels': [B], optional 'batch':[B]}
-#         out = module.forward(item)
-#         loss = out["loss"]
-#         loss_val = loss if loss.dim() == 0 else loss.mean()
-
-#         optimizer.zero_grad()
-#         loss_val.backward()
-#         optimizer.step()
-
-#         total_loss += float(loss_val.detach().cpu().item())
-#         n_batches += 1
-#         # if verbose and i % 50 == 0:
-#         #     print(f"  batch {i} loss={loss_val.detach().cpu().item():.4f}")
-#     return total_loss / max(1, n_batches)
-
-
-# # [--- M-2: 替换这个函数 ---]
-# def train_one_epoch_st(module: torch.nn.Module, dataloader: DataLoader, optimizer, device, verbose=True) -> dict:
-#     """
-#     修改：此函数现在返回一个字典，包含所有损失项的平均值。
-#     """
-#     module.train()
-#     # 使用 defaultdict 来自动累积所有损失项
-#     epoch_losses = defaultdict(float)
-#     n_batches = 0
-    
-#     for i, item in enumerate(dataloader, 1):
-#         item = move_item_to_device(item, device)  # item = {'X':[B,G], 'ind_x':[B], optional 'spatial':[B,2]}
-        
-#         # out 是 mymrdeconv.forward() 返回的字典
-#         # 包含 {'loss', 'reconstruction_loss', 'kl_local', 'kl_global', 'mmd'}
-#         out = module.forward(item) 
-        
-#         loss = out["loss"]
-#         loss_val = loss if loss.dim() == 0 else loss.mean()
-
-#         optimizer.zero_grad()
-#         loss_val.backward()
-#         optimizer.step()
-
-#         # 累积所有返回的损失项
-#         for key, value in out.items():
-#             # 确保值是标量
-#             if value.dim() > 0:
-#                 value = value.mean()
-#             epoch_losses[key] += float(value.detach().cpu().item())
-            
-#         n_batches += 1
-#         # if verbose and i % 50 == 0:
-#         #     # 仅打印主损失
-#         #     print(f"  batch {i} loss={loss_val.detach().cpu().item():.4f}")
-
-#     # 计算所有损失项的平均值
-#     avg_epoch_losses = {key: total / max(1, n_batches) for key, total in epoch_losses.items()}
-    
-#     return avg_epoch_losses
-
-
-# def main(argv=None):
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--sc-h5ad", required=True)
-#     parser.add_argument("--st-h5ad", required=True)
-#     parser.add_argument("--device", default="cpu")
-#     parser.add_argument("--epochs", type=int, default=3)
-#     parser.add_argument("--batch-size", type=int, default=128)
-#     parser.add_argument("--lr", type=float, default=1e-3)
-#     parser.add_argument("--layer", default="counts")
-#     parser.add_argument("--labels-key", default="free_annotation")
-#     args = parser.parse_args(argv)
-
-#     device = torch.device(args.device)
-
-#     # CondSCVI = safe_import_condscvi()
-#     # DestVI = safe_import_destvi()
-
-#     print("Loading sc AnnData:", args.sc_h5ad)
-#     sc_adata = sc.read_h5ad(args.sc_h5ad)
-#     print(sc_adata)
-
-#     print("Loading st AnnData:", args.st_h5ad)
-#     st_adata = sc.read_h5ad(args.st_h5ad)
-#     print(st_adata)
-
-#     # 构建自定义数据集（注意：SingleCellDataset 要求 labels 必须是 categorical）
-#     sc_dataset = SingleCellDataset(sc_adata, label_key=args.labels_key, use_layer=args.layer)
-#     st_dataset = SpatialDataset(st_adata, use_layer=args.layer, spatial_key="spatial")
-
-#     # 直接用 SC 的编码顺序构建 mapping（与 SingleCellDataset.label_names 完全一致）
-#     label_names_sc = list(map(str, sc_dataset.label_names))
-#     cell_type_mapping = {name: i for i, name in enumerate(label_names_sc)}
-#     print("cell_type_mapping（与SC编码顺序一致）:", cell_type_mapping)
-
-#     # DataLoader（默认 collate 会把 dict 的每个键堆叠为 batch tensor）
-#     sc_loader = DataLoader(sc_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-#     st_loader = DataLoader(st_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-
-#     # 实例化 CondSCVI
-#     n_input = sc_dataset.X.shape[1]
-#     n_labels = int(sc_dataset.n_labels)
-#     print(f"Instantiating CondSCVI: n_input={n_input}, n_labels={n_labels}")
-#     cond_model = CondSCVI(n_input=n_input, n_labels=n_labels, n_batch=getattr(sc_dataset, "n_batch", 1))
-#     cond_module = getattr(cond_model, "module", cond_model)
-#     cond_module.to(device)
-
-#     # CondSCVI 优化器
-#     cond_params = [p for p in cond_module.parameters() if p.requires_grad]
-#     cond_opt = torch.optim.Adam(cond_params, lr=args.lr)
-
-#     # 训练 CondSCVI
-#     print("Training CondSCVI for", args.epochs, "epochs on sc data")
-#     for ep in range(args.epochs):
-#         t0 = time.time()
-#         avg_loss = train_one_epoch_sc(cond_module, sc_loader, cond_opt, device)
-#         t1 = time.time()
-#         print(f"[CondSCVI] Epoch {ep+1}/{args.epochs} avg_loss={avg_loss:.4f} time={t1-t0:.1f}s")
-
-#     # 提取 decoder / px_decoder state_dict
-#     decoder_state = cond_module.decoder.state_dict() if hasattr(cond_module, "decoder") else None
-#     px_decoder_state = cond_module.px_decoder.state_dict() if hasattr(cond_module, "px_decoder") else None
-
-#     # 组装 DestVI 参数（对齐 CondSCVI 结构）
-#     n_spots = int(st_dataset.X.shape[0])
-#     n_genes = int(st_dataset.X.shape[1])
-#     n_latent = int(getattr(cond_module, "n_latent", 5))
-#     n_hidden = int(cond_module.px_decoder[0].in_features) if hasattr(cond_module, "px_decoder") else 128
-#     n_layers_dec = int(getattr(cond_module, "n_layers", 2))
-#     dropout_dec = float(getattr(cond_module, "dropout_rate", 0.05))
-
-#     destvi_kwargs = dict(
-#         l1_reg= 10.0,
-#         dirichlet_alpha= 0.4,
-#         dirichlet_mmd_reg=2.0,
-#         n_spots=n_spots,
-#         n_genes=n_genes,
-#         n_labels=n_labels,
-#         n_latent=n_latent,
-#         n_hidden=n_hidden,
-#         n_layers=n_layers_dec,
-#         decoder_state_dict=decoder_state,
-#         px_decoder_state_dict=px_decoder_state,
-#         px_r=(cond_module.px_r.detach().cpu().numpy() if hasattr(cond_module, "px_r") and cond_module.px_r.numel() == n_genes else np.ones(n_genes, dtype=np.float32)),
-#         cell_type_mapping=cell_type_mapping,
-#         dropout_decoder=dropout_dec
-        
-#     )
-
-#     print("Instantiating DestVI for ST training")
-#     destvi_model = DestVI(**destvi_kwargs)
-#     dest_module = getattr(destvi_model, "module", destvi_model)
-#     dest_module.to(device)
-
-#     # 冻结解码器（若 DestVI 未默认冻结）
-#     try:
-#         if hasattr(dest_module, "decoder"):
-#             for p in dest_module.decoder.parameters():
-#                 p.requires_grad = False
-#         if hasattr(dest_module, "px_decoder"):
-#             for p in dest_module.px_decoder.parameters():
-#                 p.requires_grad = False
-#     except Exception:
-#         pass
-
-#     # ST 优化器
-#     st_params = [p for p in dest_module.parameters() if p.requires_grad]
-#     st_opt = torch.optim.Adam(st_params, lr=args.lr)
-
-#     # 训练 DestVI
-#     print("Training DestVI for", args.epochs, "epochs on ST data")
-#     for ep in range(args.epochs):
-#         t0 = time.time()
-        
-#         # [--- M-2: 修改 main 循环以处理字典 ---]
-#         # 1. 捕获损失字典 (avg_loss_dict 现在是一个 dict)
-#         avg_loss_dict = train_one_epoch_st(dest_module, st_loader, st_opt, device)
-#         t1 = time.time()
-
-#         # 2. 格式化打印
-#         # (确保 'loss' 总是第一个被打印)
-#         main_loss = avg_loss_dict.get('loss', 0.0)
-#         loss_strings = [f"avg_loss={main_loss:.4f}"]
-        
-#         # 添加其他所有损失项
-#         for key, value in avg_loss_dict.items():
-#             if key != 'loss':
-#                 # 格式化所有其他损失项
-#                 loss_strings.append(f"{key}={value:.4f}")
-        
-#         print(f"[DestVI] Epoch {ep+1}/{args.epochs} " + ", ".join(loss_strings) + f" time={t1-t0:.1f}s")
-
-#     # 保存权重
-#     out_dir = "test_model_states"
-#     os.makedirs(out_dir, exist_ok=True)
-#     try:
-#         torch.save(cond_module.state_dict(), os.path.join(out_dir, "condscvi_module.pt"))
-#         torch.save(dest_module.state_dict(), os.path.join(out_dir, "destvi_module.pt"))
-#         print("Saved module state_dicts to", out_dir)
-#     except Exception as e:
-#         print("Warning: could not save state_dicts:", e)
-
-
-# if __name__ == "__main__":
-#     main()
-
 from __future__ import annotations
 
 import argparse
@@ -252,10 +10,10 @@ import scanpy as sc
 import torch
 from torch.utils.data import DataLoader
 
-# 数据集与模型
 from src.data import SingleCellDataset, SpatialDataset
 from src.models.mycondscvi import CondSCVI
 from src.models.mydestvi import DestVI
+
 
 """
 python test_data.py \
@@ -267,23 +25,35 @@ python test_data.py \
   --batch-size 256 \
   --log-file log2.txt \
   --prop-csv mydestvi_predicted_proportions_mmdAndL1.csv
-  模型不收敛
 """
 
 def move_item_to_device(item: dict, device: torch.device) -> dict:
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item.items()}
 
 
+def linear_warmup(step: int, total_warmup: int) -> float:
+    if total_warmup <= 0:
+        return 1.0
+    return float(min(1.0, step / max(1, total_warmup)))
+
+
 def train_one_epoch_sc(module: torch.nn.Module,
                        dataloader: DataLoader,
                        optimizer,
-                       device: torch.device) -> float:
+                       device: torch.device,
+                       start_step: int,
+                       warmup_steps_kl: int) -> tuple[float, int]:
+    """
+    返回 (avg_loss, new_step)
+    """
     module.train()
     total_loss = 0.0
     n_batches = 0
+    step = start_step
     for item in dataloader:
         item = move_item_to_device(item, device)
-        out = module.forward(item)
+        kl_w = linear_warmup(step, warmup_steps_kl)
+        out = module.forward(item, kl_weight=kl_w)
         loss = out["loss"]
         loss_val = loss if loss.dim() == 0 else loss.mean()
         optimizer.zero_grad()
@@ -291,19 +61,29 @@ def train_one_epoch_sc(module: torch.nn.Module,
         optimizer.step()
         total_loss += float(loss_val.detach().cpu().item())
         n_batches += 1
-    return total_loss / max(1, n_batches)
+        step += 1
+    return total_loss / max(1, n_batches), step
 
 
 def train_one_epoch_st(module: torch.nn.Module,
                        dataloader: DataLoader,
                        optimizer,
-                       device: torch.device) -> dict:
+                       device: torch.device,
+                       start_step: int,
+                       warmup_steps_kl: int,
+                       warmup_steps_reg: int) -> tuple[dict, int]:
+    """
+    返回 (avg_loss_dict, new_step)
+    """
     module.train()
     epoch_losses = defaultdict(float)
     n_batches = 0
+    step = start_step
     for item in dataloader:
         item = move_item_to_device(item, device)
-        out = module.forward(item)  # {'loss','reconstruction_loss','kl_local','kl_global','mmd'}
+        kl_w = linear_warmup(step, warmup_steps_kl)
+        reg_w = linear_warmup(step, warmup_steps_reg)
+        out = module.forward(item, kl_weight=kl_w, reg_warmup=reg_w, n_obs=1.0)  # 关键：传入 kl_weight / reg_warmup
         loss = out["loss"]
         loss_val = loss if loss.dim() == 0 else loss.mean()
         optimizer.zero_grad()
@@ -313,7 +93,9 @@ def train_one_epoch_st(module: torch.nn.Module,
             v_scalar = v if (not torch.is_tensor(v) or v.dim() == 0) else v.mean()
             epoch_losses[k] += float(v_scalar.detach().cpu().item())
         n_batches += 1
-    return {k: v / max(1, n_batches) for k, v in epoch_losses.items()}
+        step += 1
+    avg = {k: v / max(1, n_batches) for k, v in epoch_losses.items()}
+    return avg, step
 
 
 def main():
@@ -321,10 +103,9 @@ def main():
     parser.add_argument("--sc-h5ad", required=True)
     parser.add_argument("--st-h5ad", required=True)
     parser.add_argument("--device", default="cpu")
-    # 新增：独立 epoch 参数
-    parser.add_argument("--epochs", type=int, default=None, help="全局默认 epoch；若提供 --epochs-sc/--epochs-st 将分别覆盖")
-    parser.add_argument("--epochs-sc", type=int, default=None, help="CondSCVI 训练轮数")
-    parser.add_argument("--epochs-st", type=int, default=None, help="DestVI 训练轮数")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--epochs-sc", type=int, default=None)
+    parser.add_argument("--epochs-st", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--layer", default="counts")
@@ -333,15 +114,14 @@ def main():
     parser.add_argument("--prop-csv", default="destvi_predicted_proportions_mmdAndL1.csv")
     args = parser.parse_args()
 
-    # 解析独立/全局 epoch
-    epochs_sc = args.epochs_sc if args.epochs_sc is not None else (args.epochs if args.epochs is not None else 3)
-    epochs_st = args.epochs_st if args.epochs_st is not None else (args.epochs if args.epochs is not None else 3)
+    epochs_sc = args.epochs_sc if args.epochs_sc is not None else (args.epochs if args.epochs is not None else 300)
+    epochs_st = args.epochs_st if args.epochs_st is not None else (args.epochs if args.epochs is not None else 1000)
 
-    # 打开日志文件（覆盖写）
     os.makedirs(os.path.dirname(args.log_file) if os.path.dirname(args.log_file) else ".", exist_ok=True)
     log_f = open(args.log_file, "w", encoding="utf-8")
 
     def log(msg: str):
+        print(msg)
         log_f.write(msg + "\n")
         log_f.flush()
 
@@ -350,7 +130,7 @@ def main():
     log(f"参数: {args}")
     log(f"实际使用 epochs_sc={epochs_sc}, epochs_st={epochs_st}")
 
-    # 读取 AnnData
+    # 读取数据
     log(f"Loading sc AnnData: {args.sc_h5ad}")
     sc_adata = sc.read_h5ad(args.sc_h5ad)
     log(str(sc_adata))
@@ -375,45 +155,51 @@ def main():
     n_input = sc_dataset.X.shape[1]
     n_labels = int(sc_dataset.n_labels)
     log(f"Instantiating CondSCVI: n_input={n_input}, n_labels={n_labels}")
-    cond_model = CondSCVI(n_input=n_input, n_labels=n_labels, n_batch=getattr(sc_dataset, "n_batch", 0))
-    cond_module = getattr(cond_model, "module", cond_model)
-    cond_module.to(device)
+    # 单切片 => n_batch=0
+    cond_model = CondSCVI(n_input=n_input, n_labels=n_labels, n_batch=0)
+    cond_module = getattr(cond_model, "module", cond_model).to(device)
 
     cond_params = [p for p in cond_module.parameters() if p.requires_grad]
     cond_opt = torch.optim.Adam(cond_params, lr=args.lr)
 
+    # SC 训练（KL 退火前 30% steps）
+    warmup_steps_sc = int(0.3 * epochs_sc * len(sc_loader))
+    step_sc = 0
     log(f"Training CondSCVI for {epochs_sc} epochs on sc data")
     for ep in range(epochs_sc):
         t0 = time.time()
-        avg_loss = train_one_epoch_sc(cond_module, sc_loader, cond_opt, device)
+        avg_loss, step_sc = train_one_epoch_sc(cond_module, sc_loader, cond_opt, device, step_sc, warmup_steps_sc)
         t1 = time.time()
         log(f"[CondSCVI] Epoch {ep+1}/{epochs_sc} avg_loss={avg_loss:.4f} time={t1-t0:.1f}s")
 
+    # 提取冻结解码器权重
     decoder_state = None
     if hasattr(cond_model, "export_decoder_state"):
         decoder_state = cond_model.export_decoder_state()
-
     if decoder_state is None and hasattr(cond_module, "decoder_backbone"):
         decoder_state = cond_module.decoder_backbone.state_dict()
 
-    # px_decoder
     px_decoder_state = None
     if hasattr(cond_model, "export_px_decoder_state"):
         px_decoder_state = cond_model.export_px_decoder_state()
     if px_decoder_state is None and hasattr(cond_module, "px_decoder"):
         px_decoder_state = cond_module.px_decoder.state_dict()
 
-    # 强校验，避免把 None 继续传下去
     if not isinstance(decoder_state, dict):
         raise RuntimeError("decoder_state is None：请确认 CondSCVI 使用固定条件版 VAEC 并已训练，且存在 decoder_backbone")
     if not isinstance(px_decoder_state, dict):
         raise RuntimeError("px_decoder_state is None：请确认 CondSCVI.module.px_decoder 存在")
 
-    # ===== 组装 DestVI 参数（与 CondSCVI 结构对齐）=====
+    # 计算 VampPrior（p=15）
+    log("Computing VampPrior from CondSCVI ...")
+    vamp_p = 15
+    mean_vprior, var_vprior, mp_vprior = cond_model.get_vamp_prior(sc_loader, p=vamp_p, device=device)
+
+    # DestVI 参数
     n_spots = int(st_dataset.X.shape[0])
     n_genes = int(st_dataset.X.shape[1])
     n_latent = int(getattr(cond_module, "n_latent", 5))
-    n_hidden = int(cond_module.px_decoder[0].in_features)  # px_decoder 第一层 in_features = n_hidden
+    n_hidden = int(cond_module.px_decoder[0].in_features)
     n_layers_dec = int(getattr(cond_module, "n_layers", 2))
     dropout_dec = float(getattr(cond_module, "dropout_rate", 0.05))
 
@@ -427,45 +213,47 @@ def main():
         decoder_state_dict=decoder_state,
         px_decoder_state_dict=px_decoder_state,
         px_r=(cond_module.px_r.detach().cpu().numpy()
-            if hasattr(cond_module, "px_r") and cond_module.px_r.numel() == n_genes
-            else np.ones(n_genes, dtype=np.float32)),
+              if hasattr(cond_module, "px_r") and cond_module.px_r.numel() == n_genes
+              else np.ones(n_genes, dtype=np.float32)),
         cell_type_mapping=cell_type_mapping,
         dropout_decoder=dropout_dec,
+        # 传入 VampPrior
+        mean_vprior=mean_vprior,
+        var_vprior=var_vprior,
+        mp_vprior=mp_vprior,
+        # 你原先的正则基值（注意：后续用 reg_warmup 退火）
         l1_reg=10.0,
         dirichlet_alpha=0.4,
         dirichlet_mmd_reg=2.0,
     )
 
-    print("sc decoder_backbone first:",
-      next(cond_module.decoder_backbone.net[0].parameters()).shape)   # 预期: (n_hidden, n_latent + n_labels[+ n_batch?])
-
-    # 实例化后（或加载前）:
-    # print("dest MRDeconv decoder first:",
-    #       next(dest_module.decoder.net[0].parameters()).shape)          # 预期第二维相同
-
     log("Instantiating DestVI for ST training")
     destvi_model = DestVI(**destvi_kwargs)
-    dest_module = getattr(destvi_model, "module", destvi_model)
-    dest_module.to(device)
+    dest_module = getattr(destvi_model, "module", destvi_model).to(device)
 
-    # 冻结共享解码器
+    # 冻结解码器
     try:
-        if hasattr(dest_module, "decoder"):
-            for p in dest_module.decoder.parameters():
-                p.requires_grad = False
-        if hasattr(dest_module, "px_decoder"):
-            for p in dest_module.px_decoder.parameters():
-                p.requires_grad = False
+        for p in dest_module.decoder.parameters():
+            p.requires_grad = False
+        for p in dest_module.px_decoder.parameters():
+            p.requires_grad = False
     except Exception as e:
         log(f"冻结解码器时出现异常: {e}")
 
     st_params = [p for p in dest_module.parameters() if p.requires_grad]
     st_opt = torch.optim.Adam(st_params, lr=args.lr)
 
+    # ST 训练（KL 退火 30%，L1/MMD 退火 40%）
+    warmup_steps_kl_st = int(0.3 * epochs_st * len(st_loader))
+    warmup_steps_reg_st = int(0.4 * epochs_st * len(st_loader))
+    step_st = 0
+
     log(f"Training DestVI for {epochs_st} epochs on ST data")
     for ep in range(epochs_st):
         t0 = time.time()
-        avg_loss_dict = train_one_epoch_st(dest_module, st_loader, st_opt, device)
+        avg_loss_dict, step_st = train_one_epoch_st(
+            dest_module, st_loader, st_opt, device, step_st, warmup_steps_kl_st, warmup_steps_reg_st
+        )
         t1 = time.time()
         main_loss = avg_loss_dict.get("loss", 0.0)
         others = ", ".join([f"{k}={v:.4f}" for k, v in avg_loss_dict.items() if k != "loss"])
@@ -476,20 +264,15 @@ def main():
     with torch.no_grad():
         X_st_full = st_dataset.X.to(device)
         props = dest_module.get_proportions(x=X_st_full, keep_noise=False)
-        if torch.is_tensor(props):
-            props_np = props.detach().cpu().numpy()
-        else:
-            props_np = np.asarray(props)
+        props_np = props.detach().cpu().numpy() if torch.is_tensor(props) else np.asarray(props)
 
-    # 保存到 AnnData
     st_adata.obsm["proportions"] = props_np
 
-    # 保存 CSV（行：spot，列：细胞类型）
+    # 保存 CSV
     columns = label_names_sc[:props_np.shape[1]]
     prop_df = pd.DataFrame(props_np, index=st_adata.obs_names, columns=columns)
-    prop_csv_path = args.prop_csv
-    prop_df.to_csv(prop_csv_path, index=True)
-    log(f"Saved predicted proportions to {prop_csv_path}")
+    prop_df.to_csv(args.prop_csv, index=True)
+    log(f"Saved predicted proportions to {args.prop_csv}")
 
     # 基本统计
     col_means = prop_df.mean(axis=0)
@@ -499,7 +282,7 @@ def main():
     row_sum_mean = prop_df.sum(axis=1).mean()
     log(f"Average row sum (should be ~1): {row_sum_mean:.4f}")
 
-    # 保存模型权重
+    # 保存权重
     out_dir = "test_model_states"
     os.makedirs(out_dir, exist_ok=True)
     try:
@@ -509,7 +292,7 @@ def main():
     except Exception as e:
         log(f"Warning: could not save state_dicts: {e}")
 
-    # 可选：保存带预测比例的 ST AnnData
+    # 可选：保存带比例的 ST AnnData
     try:
         st_adata.write(os.path.join(out_dir, "st_with_proportions.h5ad"))
         log("Saved updated ST AnnData with proportions.")
@@ -517,11 +300,6 @@ def main():
         log(f"Warning: could not write updated ST AnnData: {e}")
 
     log("训练完成。")
-    print("has export_decoder_state:", hasattr(cond_model, "export_decoder_state"))
-    print("type(sc_model.module):", type(cond_model.module))
-    print("has decoder_backbone:", hasattr(cond_model.module, "decoder_backbone"))
-    print("has decoder:", hasattr(cond_model.module, "decoder"))
-    print("has px_decoder:", hasattr(cond_model.module, "px_decoder"))
     log_f.close()
 
 

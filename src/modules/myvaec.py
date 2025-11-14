@@ -37,7 +37,7 @@ class VAEC(nn.Module):
         self.log_variational = log_variational
 
         # dispersion logits (per gene)
-        self.px_r = nn.Parameter(torch.zeros(n_input))
+        self.px_r = nn.Parameter(torch.randn(n_input))
 
         # Encoder (固定条件拼接)
         self.z_encoder = Encoder(
@@ -113,7 +113,7 @@ class VAEC(nn.Module):
         px_rate = library * px_scale   # broadcast
         return {"px_rate": px_rate}
 
-    def forward(self, item, kl_weight=1.0):
+    def forward(self, item, kl_weight=1.0, n_samples: int = 1):
         x = item["X"]
         labels = item["labels"]
         batch_index = item.get("batch", None)
