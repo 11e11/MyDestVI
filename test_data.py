@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import os
+import random
 import time
 import numpy as np
 import pandas as pd
@@ -23,9 +24,26 @@ python test_data.py \
   --epochs-sc 300 \
   --epochs-st 1500 \
   --batch-size 256 \
-  --log-file log2.txt \
-  --prop-csv mydestvi_predicted_proportions_mmdAndL1.csv
+  --log-file ./results/log2.txt \
+  --prop-csv ./results/mydestvi_predicted_proportions_mmdAndL1.csv
 """
+
+def set_seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # cuDNN
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # 设置 PyTorch 操作的算法为确定性（PyTorch>=1.12）
+    # try:
+    #     torch.use_deterministic_algorithms(True)
+    # except Exception as e:
+    #     print("Warning: deterministic_algorithms not set:", e)
 
 def move_item_to_device(item: dict, device: torch.device) -> dict:
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item.items()}
@@ -37,32 +55,50 @@ def linear_warmup(step: int, total_warmup: int) -> float:
     return float(min(1.0, step / max(1, total_warmup)))
 
 
-def train_one_epoch_sc(module: torch.nn.Module,
-                       dataloader: DataLoader,
-                       optimizer,
-                       device: torch.device,
-                       start_step: int,
-                       warmup_steps_kl: int) -> tuple[float, int]:
+def train_one_epoch_sc(
+        module: torch.nn.Module,
+        dataloader: DataLoader,
+        optimizer,
+        device: torch.device,
+        start_step: int,
+        warmup_steps_kl: int
+    ) -> tuple[dict, int]:
     """
-    返回 (avg_loss, new_step)
+    返回 ({'loss':..., 'reconstruction_loss':..., 'kl_local':..., 'kl_library':...}, new_step)
     """
     module.train()
-    total_loss = 0.0
+    epoch_losses = defaultdict(float)
     n_batches = 0
     step = start_step
+
     for item in dataloader:
         item = move_item_to_device(item, device)
         kl_w = linear_warmup(step, warmup_steps_kl)
+
         out = module.forward(item, kl_weight=kl_w)
+
         loss = out["loss"]
         loss_val = loss if loss.dim() == 0 else loss.mean()
+
         optimizer.zero_grad()
         loss_val.backward()
         optimizer.step()
-        total_loss += float(loss_val.detach().cpu().item())
+
+        # 累积每个 loss 项
+        for k, v in out.items():
+            # 如果是 tensor，就取 mean 再取 item
+            if torch.is_tensor(v):
+                epoch_losses[k] += float(v.detach().cpu().item())
+            else:
+                epoch_losses[k] += float(v)
+
         n_batches += 1
         step += 1
-    return total_loss / max(1, n_batches), step
+
+    # 计算平均值
+    avg_losses = {k: v / max(1, n_batches) for k, v in epoch_losses.items()}
+    return avg_losses, step
+
 
 
 def train_one_epoch_st(module: torch.nn.Module,
@@ -95,11 +131,12 @@ def train_one_epoch_st(module: torch.nn.Module,
             epoch_losses[k] += float(v_scalar.detach().cpu().item())
         n_batches += 1
         step += 1
-    avg = {k: v / max(1, n_batches) for k, v in epoch_losses.items()}
+    avg = {k: v / n_batches for k, v in epoch_losses.items()}  # 不用 max(1, n_batches)
     return avg, step
 
 
 def main():
+    set_seed(0)
     parser = argparse.ArgumentParser()
     parser.add_argument("--sc-h5ad", required=True)
     parser.add_argument("--st-h5ad", required=True)
@@ -163,15 +200,21 @@ def main():
     cond_params = [p for p in cond_module.parameters() if p.requires_grad]
     cond_opt = torch.optim.Adam(cond_params, lr=args.lr)
 
-    # SC 训练（KL 退火前 30% steps）
+    # SC 训练
     warmup_steps_sc = int(0.3 * epochs_sc * len(sc_loader))
     step_sc = 0
     log(f"Training CondSCVI for {epochs_sc} epochs on sc data")
+
     for ep in range(epochs_sc):
         t0 = time.time()
-        avg_loss, step_sc = train_one_epoch_sc(cond_module, sc_loader, cond_opt, device, step_sc, warmup_steps_sc)
+        avg_losses, step_sc = train_one_epoch_sc(
+            cond_module, sc_loader, cond_opt, device, step_sc, warmup_steps_sc
+        )
         t1 = time.time()
-        log(f"[CondSCVI] Epoch {ep+1}/{epochs_sc} avg_loss={avg_loss:.4f} time={t1-t0:.1f}s")
+
+        loss_str = ", ".join([f"{k}={v:.4f}" for k, v in avg_losses.items()])
+        log(f"[CondSCVI] Epoch {ep+1}/{epochs_sc} {loss_str} time={t1-t0:.1f}s")
+
 
     # 提取冻结解码器权重
     decoder_state = None
@@ -245,7 +288,7 @@ def main():
     st_opt = torch.optim.Adam(st_params, lr=args.lr)
 
     # ST 训练（KL 退火 30%，L1/MMD 退火 40%）
-    warmup_steps_kl_st = int(0.3 * epochs_st * len(st_loader))
+    warmup_steps_kl_st = int(0.4 * epochs_st * len(st_loader))
     warmup_steps_reg_st = int(0.4 * epochs_st * len(st_loader))
     step_st = 0
 
@@ -253,7 +296,14 @@ def main():
     for ep in range(epochs_st):
         t0 = time.time()
         avg_loss_dict, step_st = train_one_epoch_st(
-            dest_module, st_loader, st_opt, device, step_st, warmup_steps_kl_st, warmup_steps_reg_st, st_dataset.X.shape[0]
+            dest_module,
+            st_loader,
+            st_opt,
+            device,
+            st_dataset.X.shape[0],      # n_obs 正确传入
+            step_st,                    # start_step
+            warmup_steps_kl_st,
+            warmup_steps_reg_st
         )
         t1 = time.time()
         main_loss = avg_loss_dict.get("loss", 0.0)
