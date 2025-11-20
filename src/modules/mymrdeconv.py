@@ -326,14 +326,32 @@ class MRDeconv(nn.Module):
 
         return sum_Kxx + sum_Kyy - 2.0 * sum_Kxy
 
+    # @torch.no_grad()
+    # def get_proportions(self, x=None, keep_noise=False):
+    #     """
+    #     保持你现有实现：若 amortization 包含 proportion，则用 V_encoder(FClayers)，否则直接用参数 V
+    #     """
+    #     if self.amortization in ["both", "proportion"]:
+    #         if x is None:
+    #             raise ValueError("FC 模式需要传入 x")
+    #         x_ = torch.log1p(x)
+    #         res = F.softplus(self.V_encoder(x_))
+    #     else:
+    #         res = F.softplus(self.V)
+    #         if res.dim() == 2 and res.shape[0] == self.n_labels + 1:
+    #             res = res.T
+
+    #     if not keep_noise:
+    #         res = res[:, :-1]
+    #     res = res / (res.sum(axis=1, keepdims=True) + 1e-8)
+    #     return res
+
     @torch.no_grad()
     def get_proportions(self, x=None, keep_noise=False):
-        """
-        保持你现有实现：若 amortization 包含 proportion，则用 V_encoder(FClayers)，否则直接用参数 V
-        """
+        was_training = self.training
+        self.eval()                        # ★ 强制关闭 dropout/bn
+
         if self.amortization in ["both", "proportion"]:
-            if x is None:
-                raise ValueError("FC 模式需要传入 x")
             x_ = torch.log1p(x)
             res = F.softplus(self.V_encoder(x_))
         else:
@@ -341,10 +359,14 @@ class MRDeconv(nn.Module):
             if res.dim() == 2 and res.shape[0] == self.n_labels + 1:
                 res = res.T
 
+        if was_training:
+            self.train()                   # ★ 恢复原来的训练状态
+
         if not keep_noise:
             res = res[:, :-1]
         res = res / (res.sum(axis=1, keepdims=True) + 1e-8)
         return res
+
 
     @torch.no_grad()
     def get_gamma(self, x=None):
