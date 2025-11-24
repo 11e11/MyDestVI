@@ -137,6 +137,9 @@ class DestVI(nn.Module):
     def attach_full_X(self, adata, layer=None):
         return self.module.attach_full_X(adata, layer)
 
+    def attach_dual_graph(self, adata, k_spatial=6, k_expr=10, spatial_key='spatial'):  # 🔥 新增
+        return self.module.attach_dual_graph(adata, k_spatial, k_expr, spatial_key)
+
     def attach_graph(self, adata=None, edge_index=None, edge_weight=None, k=6, spatial_key='spatial'):
         return self.module.attach_graph(adata, edge_index, edge_weight, k, spatial_key)
 

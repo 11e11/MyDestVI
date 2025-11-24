@@ -24,8 +24,11 @@ python test_data.py \
   --epochs-sc 300 \
   --epochs-st 1500 \
   --batch-size 256 \
-  --log-file ./results/log2.txt \
-  --prop-csv ./results/mydestvi_predicted_proportions_mmdAndL1.csv
+  --use-dual-graph \
+  --k-spatial 6 \
+  --k-expr 10 \
+  --log-file ./results/log_dual_graph.txt \
+  --prop-csv ./results/mydestvi_predicted_proportions_dual_graph.csv
 """
 
 def set_seed(seed=0):
@@ -150,6 +153,15 @@ def main():
     parser.add_argument("--labels-key", default="free_annotation")
     parser.add_argument("--log-file", default="log.txt")
     parser.add_argument("--prop-csv", default="destvi_predicted_proportions_mmdAndL1.csv")
+    
+    # 🔥 新增双图参数
+    parser.add_argument("--use-dual-graph", action="store_true", help="启用双图模式（空间图+表达图）")
+    parser.add_argument("--k-spatial", type=int, default=6, help="空间图的 k-NN 邻居数")
+    parser.add_argument("--k-expr", type=int, default=10, help="表达图的 k-NN 邻居数")
+    parser.add_argument("--spatial-key", default="spatial", help="st_adata.obsm 中的空间坐标 key")
+    parser.add_argument("--gat-hidden", type=int, default=128, help="GAT 隐藏层维度")
+    parser.add_argument("--gat-heads", type=int, default=4, help="GAT 注意力头数（暂未使用）")
+    
     args = parser.parse_args()
 
     epochs_sc = args.epochs_sc if args.epochs_sc is not None else (args.epochs if args.epochs is not None else 300)
@@ -167,6 +179,12 @@ def main():
     log(f"启动时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"参数: {args}")
     log(f"实际使用 epochs_sc={epochs_sc}, epochs_st={epochs_st}")
+    
+    # 🔥 双图模式提示
+    if args.use_dual_graph:
+        log(f"🔥 启用双图模式：k_spatial={args.k_spatial}, k_expr={args.k_expr}")
+    else:
+        log("📊 使用标准 FC 模式（无图结构）")
 
     # 读取数据
     log(f"Loading sc AnnData: {args.sc_h5ad}")
@@ -179,10 +197,10 @@ def main():
 
     # 构建数据集
     sc_dataset = SingleCellDataset(sc_adata, label_key=args.labels_key, use_layer=args.layer)
-    st_dataset = SpatialDataset(st_adata, use_layer=args.layer, spatial_key="spatial")
+    st_dataset = SpatialDataset(st_adata, use_layer=args.layer, spatial_key=args.spatial_key)
 
     label_names_sc = list(map(str, sc_dataset.label_names))
-    cell_type_mapping = {name: i for i, name in enumerate(label_names_sc)}
+    cell_type_mapping = np.array(label_names_sc)  # 🔥 改为 numpy 数组（mydestvi.py 需要）
     log(f"cell_type_mapping（与SC编码顺序一致）: {cell_type_mapping}")
 
     # DataLoader
@@ -265,15 +283,40 @@ def main():
         mean_vprior=mean_vprior,
         var_vprior=var_vprior,
         mp_vprior=mp_vprior,
-        # 你原先的正则基值（注意：后续用 reg_warmup 退火）
+        # 正则基值（用 reg_warmup 退火）
         l1_reg=10.0,
         dirichlet_alpha=0.4,
         dirichlet_mmd_reg=2.0,
+        # 🔥 双图参数
+        use_gat=args.use_dual_graph,           # 只有启用双图时才设为 True
+        use_dual_graph=args.use_dual_graph,    # 双图开关
+        dual_graph_fusion="concat",            # 融合方式
+        gat_hidden=args.gat_hidden,
+        gat_heads=args.gat_heads,
     )
 
     log("Instantiating DestVI for ST training")
     destvi_model = DestVI(**destvi_kwargs)
     dest_module = getattr(destvi_model, "module", destvi_model).to(device)
+
+    # 🔥 如果启用双图，附加图结构
+    if args.use_dual_graph:
+        log("🔥 构建双图结构（空间图 + 表达图）...")
+        try:
+            # 1. 附加全量 X
+            destvi_model.attach_full_X(st_adata, layer=args.layer)
+            
+            # 2. 构建并附加双图
+            destvi_model.attach_dual_graph(
+                st_adata, 
+                k_spatial=args.k_spatial, 
+                k_expr=args.k_expr, 
+                spatial_key=args.spatial_key
+            )
+            log("✅ 双图构建成功！")
+        except Exception as e:
+            log(f"❌ 双图构建失败: {e}")
+            raise
 
     # 冻结解码器
     try:
@@ -287,9 +330,9 @@ def main():
     st_params = [p for p in dest_module.parameters() if p.requires_grad]
     st_opt = torch.optim.Adam(st_params, lr=args.lr)
 
-    # ST 训练（KL 退火 30%，L1/MMD 退火 40%）
-    warmup_steps_kl_st = int(0.4 * epochs_st * len(st_loader))
-    warmup_steps_reg_st = int(0.4 * epochs_st * len(st_loader))
+    # ST 训练（KL 退火 40%，L1/MMD 退火 40%）
+    warmup_steps_kl_st = int(0.8 * epochs_st * len(st_loader))
+    warmup_steps_reg_st = int(0.8 * epochs_st * len(st_loader))
     step_st = 0
 
     log(f"Training DestVI for {epochs_st} epochs on ST data")
@@ -313,8 +356,14 @@ def main():
     # 预测比例
     log("Computing DestVI predicted proportions for full ST dataset...")
     with torch.no_grad():
-        X_st_full = st_dataset.X.to(device)
-        props = dest_module.get_proportions(x=X_st_full, keep_noise=False)
+        if args.use_dual_graph:
+            # 双图模式：直接调用（已缓存全量 X）
+            props = dest_module.get_proportions(x=None, keep_noise=False)
+        else:
+            # FC 模式：需要传入 X
+            X_st_full = st_dataset.X.to(device)
+            props = dest_module.get_proportions(x=X_st_full, keep_noise=False)
+        
         props_np = props.detach().cpu().numpy() if torch.is_tensor(props) else np.asarray(props)
 
     st_adata.obsm["proportions"] = props_np

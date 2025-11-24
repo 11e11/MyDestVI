@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal, Dirichlet
 import torch.nn.functional as F
+import numpy as np
 
 from src.nn import FCLayers
 from src.distributions.negative_binomial import NegativeBinomial
@@ -42,6 +43,8 @@ class MRDeconv(nn.Module):
         use_gat: bool = False,
         gat_hidden: int = 64,
         gat_heads: int = 4,
+        use_dual_graph: bool = False,           # 双图
+        dual_graph_fusion: str = "concat",      # 双图融合方式
         **kwargs,
     ):
         super().__init__()
@@ -60,6 +63,7 @@ class MRDeconv(nn.Module):
         self.eta_reg = float(eta_reg)
 
         self.use_gat = use_gat
+        self.use_dual_graph = use_dual_graph
         self.gat_hidden = gat_hidden
         self.gat_heads = gat_heads
 
@@ -143,8 +147,64 @@ class MRDeconv(nn.Module):
                 nn.Linear(n_hidden, n_labels + 1),
             )
         else:
-            # 省略 GAT 实现（与之前一致），如需请告知
-            raise NotImplementedError("use_gat=True 目前未在此替换版中实现")
+            # === GAT/GNN 模式 ===
+            from torch_geometric.nn import GINEConv
+            
+            if not use_dual_graph:
+                # --- 单图模式（你可以后续实现，现在先报错）---
+                raise NotImplementedError("use_gat=True 且 use_dual_graph=False 暂未实现，请设置 use_dual_graph=True")
+            
+            else:
+                # === 双图模式 ===
+                hidden = gat_hidden
+                in_ch = n_genes
+                
+                def mlp_block(in_dim, out_dim):
+                    return nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.BatchNorm1d(hidden),
+                        nn.ReLU(),
+                        nn.Dropout(p=0.1),
+                        nn.Linear(hidden, out_dim),
+                    )
+                
+                # gamma 分支的双图编码器
+                self.gamma_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                self.gamma_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                self.gamma_spatial_ln = nn.LayerNorm(hidden)
+                self.gamma_expr_ln = nn.LayerNorm(hidden)
+                
+                # V 分支的双图编码器
+                self.V_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                self.V_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                self.V_spatial_ln = nn.LayerNorm(hidden)
+                self.V_expr_ln = nn.LayerNorm(hidden)
+                
+                # 融合层（concat 模式）
+                if dual_graph_fusion == "concat":
+                    self.gamma_fusion = nn.Sequential(
+                        nn.Linear(hidden * 2, hidden),
+                        nn.ReLU(),
+                        nn.Dropout(p=0.1)
+                    )
+                    self.V_fusion = nn.Sequential(
+                        nn.Linear(hidden * 2, hidden),
+                        nn.ReLU(),
+                        nn.Dropout(p=0.1)
+                    )
+                else:
+                    raise NotImplementedError(f"fusion={dual_graph_fusion} 未实现")
+                
+                # 输出层
+                self.gamma_output = nn.Linear(hidden, n_latent * n_labels)
+                self.V_output = nn.Linear(hidden, n_labels + 1)
+                
+                # 双图的 buffer（用于缓存图结构）
+                self.register_buffer("_X_all", torch.empty(0), persistent=False)
+                self.register_buffer("_spatial_edge_index", torch.empty((2, 0), dtype=torch.long), persistent=False)
+                self.register_buffer("_spatial_edge_weight", torch.empty(0, dtype=torch.float32), persistent=False)
+                self.register_buffer("_expr_edge_index", torch.empty((2, 0), dtype=torch.long), persistent=False)
+                self.register_buffer("_expr_edge_weight", torch.empty(0, dtype=torch.float32), persistent=False)
 
         # Dirichlet 先验超参
         if dirichlet_alpha is None:
@@ -209,40 +269,93 @@ class MRDeconv(nn.Module):
 
     def generative(self, x: torch.Tensor, ind_x: torch.Tensor):
         """
-        核心生成图
+        核心生成图（支持双图）
         """
         m = x.shape[0]
         library = x.sum(1, keepdim=True)
-        beta = torch.exp(self.beta)            # [n_genes]
-        eps = F.softplus(self.eta)             # [n_genes]
+        beta = torch.exp(self.beta)
+        eps = F.softplus(self.eta)
 
         x_ = torch.log1p(torch.clamp_min(x, 0.0))
 
-        # gamma / v
-        if self.amortization in ["both", "latent"]:
-            gamma_ind = torch.transpose(self.gamma_encoder(x_), 0, 1).reshape((self.n_latent, self.n_labels, -1))
+        # === gamma / v 编码 ===
+        if self.use_gat and self.use_dual_graph:
+            # --- 双图模式 ---
+            if not hasattr(self, "_X_all") or self._X_all.numel() == 0:
+                raise RuntimeError("双图模式需要先调用 attach_full_X(adata)")
+            if self._spatial_edge_index.numel() == 0 or self._expr_edge_index.numel() == 0:
+                raise RuntimeError("双图模式需要先调用 attach_dual_graph(adata)")
+            
+            # 全量数据
+            X_all_log = self._X_all.to(x.device)  # 🔥 不需要再 log1p！ 
+            
+            # 边权重
+            # 🔥 边索引和边权重都要移到正确的设备
+            spatial_edge_index = self._spatial_edge_index.to(x.device)
+            spatial_attr = self._spatial_edge_weight.to(x.device).unsqueeze(-1)
+
+            expr_edge_index = self._expr_edge_index.to(x.device)
+            expr_attr = self._expr_edge_weight.to(x.device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
+            
+            # === gamma 分支：双图编码 + 融合 ===
+            h_s_gamma = self.gamma_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)  # 🔥 使用新变量
+            h_s_gamma = self.gamma_spatial_ln(h_s_gamma)
+            h_s_gamma = F.elu(h_s_gamma)
+
+            h_e_gamma = self.gamma_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)  # 🔥 使用新变量
+            h_e_gamma = self.gamma_expr_ln(h_e_gamma)
+            h_e_gamma = F.elu(h_e_gamma)
+
+            h_gamma = torch.cat([h_s_gamma, h_e_gamma], dim=-1)
+            h_gamma = self.gamma_fusion(h_gamma)
+            gamma_all = self.gamma_output(h_gamma)
+
+            gamma_mb = gamma_all[ind_x, :]
+            gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent)
+            gamma_ind = gamma_ind.permute(2, 1, 0)
+
+            # === V 分支：双图编码 + 融合 ===
+            h_s_v = self.V_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)  # 🔥 使用新变量
+            h_s_v = self.V_spatial_ln(h_s_v)
+            h_s_v = F.elu(h_s_v)
+
+            h_e_v = self.V_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)  # 🔥 使用新变量
+            h_e_v = self.V_expr_ln(h_e_v)
+            h_e_v = F.elu(h_e_v)
+
+            h_v = torch.cat([h_s_v, h_e_v], dim=-1)
+            h_v = self.V_fusion(h_v)
+            v_all = self.V_output(h_v)
+
+            v_ind = F.softplus(v_all[ind_x, :])
+            
         else:
-            gamma_ind = self.gamma[:, :, ind_x]
-        if self.amortization in ["both", "proportion"]:
-            v_ind = F.softplus(self.V_encoder(x_))        # [m, n_labels+1]
-        else:
-            v_ind = F.softplus(self.V[:, ind_x].T)
+            # --- FC 模式（原逻辑）---
+            if self.amortization in ["both", "latent"]:
+                gamma_ind = torch.transpose(self.gamma_encoder(x_), 0, 1).reshape((self.n_latent, self.n_labels, -1))
+            else:
+                gamma_ind = self.gamma[:, :, ind_x]
+            
+            if self.amortization in ["both", "proportion"]:
+                v_ind = F.softplus(self.V_encoder(x_))
+            else:
+                v_ind = F.softplus(self.V[:, ind_x].T)
 
         # 解码每个 celltype 的 rate（未乘 library）
-        gamma_mlb = torch.transpose(gamma_ind, 2, 0)      # [m, n_labels, n_latent]
-        px_rate_ct = self._decode_ct(gamma_mlb)           # [m, n_labels, n_genes]
+        gamma_mlb = torch.transpose(gamma_ind, 2, 0)            # [m, n_labels, n_latent]
+        px_rate_ct = self._decode_ct(gamma_mlb)                # [m, n_labels, n_genes]
 
         # 合成 dummy + 各类型
         eps_ct = eps.repeat((m, 1)).view(m, 1, -1)
-        r_hat = torch.cat([beta.unsqueeze(0).unsqueeze(1) * px_rate_ct, eps_ct], dim=1)  # [m, n_labels+1, n_genes]
-        px_scale = torch.sum(v_ind.unsqueeze(2) * r_hat, dim=1)                          # [m, n_genes]
-        px_rate = library * px_scale                                                     # [m, n_genes]
+        r_hat = torch.cat([beta.unsqueeze(0).unsqueeze(1) * px_rate_ct, eps_ct], dim=1)
+        px_scale = torch.sum(v_ind.unsqueeze(2) * r_hat, dim=1)
+        px_rate = library * px_scale
 
         return {
             "px_rate": px_rate,
             "px_scale": px_scale,
-            "gamma": gamma_mlb,    # [m, n_labels, n_latent]
-            "v": v_ind,            # [m, n_labels+1]
+            "gamma": gamma_mlb,
+            "v": v_ind,
         }
 
     def forward(self, item: dict, kl_weight: float = 1.0, n_obs: float = 1.0, reg_warmup: float = 1.0):
@@ -326,32 +439,40 @@ class MRDeconv(nn.Module):
 
         return sum_Kxx + sum_Kyy - 2.0 * sum_Kxy
 
-    # @torch.no_grad()
-    # def get_proportions(self, x=None, keep_noise=False):
-    #     """
-    #     保持你现有实现：若 amortization 包含 proportion，则用 V_encoder(FClayers)，否则直接用参数 V
-    #     """
-    #     if self.amortization in ["both", "proportion"]:
-    #         if x is None:
-    #             raise ValueError("FC 模式需要传入 x")
-    #         x_ = torch.log1p(x)
-    #         res = F.softplus(self.V_encoder(x_))
-    #     else:
-    #         res = F.softplus(self.V)
-    #         if res.dim() == 2 and res.shape[0] == self.n_labels + 1:
-    #             res = res.T
-
-    #     if not keep_noise:
-    #         res = res[:, :-1]
-    #     res = res / (res.sum(axis=1, keepdims=True) + 1e-8)
-    #     return res
 
     @torch.no_grad()
     def get_proportions(self, x=None, keep_noise=False):
         was_training = self.training
-        self.eval()                        # ★ 强制关闭 dropout/bn
+        self.eval()
 
-        if self.amortization in ["both", "proportion"]:
+        if self.use_gat and self.use_dual_graph:
+            # --- 双图模式 ---
+            # 从模型参数推断设备
+            device = next(self.parameters()).device
+            X_all_log = self._X_all.to(device)
+            
+            # 移动图结构到正确设备
+            spatial_edge_index = self._spatial_edge_index.to(device)
+            spatial_attr = self._spatial_edge_weight.to(device).unsqueeze(-1)
+            expr_edge_index = self._expr_edge_index.to(device)
+            expr_attr = self._expr_edge_weight.to(device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
+            
+            h_s = self.V_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)
+            h_s = self.V_spatial_ln(h_s)
+            h_s = F.elu(h_s)
+            
+            h_e = self.V_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)
+            h_e = self.V_expr_ln(h_e)
+            h_e = F.elu(h_e)
+            
+            h = torch.cat([h_s, h_e], dim=-1)
+            h = self.V_fusion(h)
+            res = F.softplus(self.V_output(h))
+        
+        elif self.amortization in ["both", "proportion"]:
+            # --- FC 模式 ---
+            if x is None:
+                raise ValueError("FC 模式需要传入 x")
             x_ = torch.log1p(x)
             res = F.softplus(self.V_encoder(x_))
         else:
@@ -360,17 +481,43 @@ class MRDeconv(nn.Module):
                 res = res.T
 
         if was_training:
-            self.train()                   # ★ 恢复原来的训练状态
+            self.train()
 
         if not keep_noise:
             res = res[:, :-1]
         res = res / (res.sum(axis=1, keepdims=True) + 1e-8)
         return res
 
-
     @torch.no_grad()
     def get_gamma(self, x=None):
-        if self.amortization in ["latent", "both"]:
+        if self.use_gat and self.use_dual_graph:
+            # --- 双图模式 ---
+            X_all = torch.clamp_min(self._X_all.to(self.gamma_output.weight.device, dtype=torch.float32), 0.0)
+            X_all_log = self._X_all.to(self.gamma_output.weight.device)  # 🔥 不需要再 log1p！ 
+            
+            # 🔥 移动到正确设备
+            spatial_edge_index = self._spatial_edge_index.to(X_all.device)
+            spatial_attr = self._spatial_edge_weight.to(X_all.device).unsqueeze(-1)
+            expr_edge_index = self._expr_edge_index.to(X_all.device)
+            expr_attr = self._expr_edge_weight.to(X_all.device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
+
+            h_s = self.gamma_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)  # 🔥
+            h_s = self.gamma_spatial_ln(h_s)
+            h_s = F.elu(h_s)
+
+            h_e = self.gamma_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)  # 🔥
+            h_e = self.gamma_expr_ln(h_e)
+            h_e = F.elu(h_e)
+
+            h = torch.cat([h_s, h_e], dim=-1)
+            h = self.gamma_fusion(h)
+            gamma_all = self.gamma_output(h)
+            N = gamma_all.size(0)
+            gamma = gamma_all.view(N, self.n_labels, self.n_latent).permute(2, 1, 0)
+            return gamma.cpu().numpy()
+        
+        elif self.amortization in ["latent", "both"]:
+            # --- FC 模式 ---
             if x is None:
                 raise ValueError("FC 模式需要传入 x")
             x_ = torch.log1p(x)
@@ -378,3 +525,67 @@ class MRDeconv(nn.Module):
             return torch.transpose(gamma, 0, 1).reshape((self.n_latent, self.n_labels, -1)).cpu().numpy()
         else:
             return self.gamma.cpu().numpy()
+        
+    
+    # def attach_full_X(self, adata, layer=None):
+    #     """
+    #     将全量表达矩阵缓存为 buffer
+    #     """
+    #     from scipy.sparse import issparse
+        
+    #     if layer is not None and layer in getattr(adata, "layers", {}):
+    #         X = adata.layers[layer]
+    #     else:
+    #         X = adata.X
+        
+    #     if issparse(X):
+    #         X = X.toarray()
+    #     X = np.asarray(X, dtype=np.float32)
+        
+    #     self.register_buffer("_X_all", torch.from_numpy(X), persistent=False)
+    #     print(f"✅ 全量 X 已缓存：{X.shape}")
+    #     return self
+    def attach_full_X(self, adata, layer=None):
+        """
+        将全量表达矩阵缓存为 buffer（带 library size 归一化）
+        """
+        from scipy.sparse import issparse
+        
+        if layer is not None and layer in getattr(adata, "layers", {}):
+            X = adata.layers[layer]
+        else:
+            X = adata.X
+        
+        if issparse(X):
+            X = X.toarray()
+        X = np.asarray(X, dtype=np.float32)
+        
+        # 🔥 关键：先做 library size 归一化
+        library_size = X.sum(axis=1, keepdims=True)  # [N, 1]
+        X_normalized = X / (library_size + 1e-6) * 10000  # 归一化到 10000 counts
+        
+        # 🔥 然后 log1p
+        X_log = np.log1p(X_normalized)
+        
+        self.register_buffer("_X_all", torch.from_numpy(X_log), persistent=False)  # 直接缓存 log 后的数据
+        print(f"✅ 全量 X 已缓存（已归一化+log1p）：{X.shape}")
+        return self
+
+    def attach_dual_graph(self, adata, k_spatial=6, k_expr=10, spatial_key='spatial'):
+        """
+        构建并注册双图结构
+        """
+        if not getattr(self, 'use_dual_graph', False):
+            raise RuntimeError("use_dual_graph=False，请在初始化时设置 use_dual_graph=True")
+        
+        from ..utils.dual_graph_builder import build_dual_graphs
+        
+        graphs = build_dual_graphs(adata, k_spatial=k_spatial, k_expr=k_expr, spatial_key=spatial_key)
+        
+        self.register_buffer("_spatial_edge_index", graphs['spatial_edge_index'], persistent=False)
+        self.register_buffer("_spatial_edge_weight", graphs['spatial_edge_weight'], persistent=False)
+        self.register_buffer("_expr_edge_index", graphs['expr_edge_index'], persistent=False)
+        self.register_buffer("_expr_edge_weight", graphs['expr_edge_weight'], persistent=False)
+        
+        print(f"✅ 双图已注册到模块")
+        return self
