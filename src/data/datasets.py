@@ -198,37 +198,52 @@ class SingleCellDataset(Dataset):
 
 
 class SpatialDataset(Dataset):
-    """空间转录组数据集"""
-    def __init__(self, adata, use_layer: str | None = None, spatial_key: str = "spatial"):
+    """空间转录组数据集（支持双输入：raw counts + preprocessed features）"""
+    def __init__(self, adata, 
+                 use_layer: str | None = None,
+                 encoder_layer: str | None = None,  # 🔥 新增：用于 encoder 的预处理 layer
+                 spatial_key: str = "spatial"):
         """
         Args:
             adata: AnnData对象
-            use_layer: 使用的layer
-            spatial_key: 空间坐标的键（若存在则返回）
+            use_layer: 用于 likelihood 重构的 layer (raw counts)
+            encoder_layer: 用于 encoder 的预处理 layer (normalized + log1p)
+            spatial_key: 空间坐标的键
         """
-        # 表达矩阵 -> 可写 float32 ndarray -> torch.tensor
+        # 1. Raw counts for likelihood (用于 NB 重构)
         if use_layer and (hasattr(adata, "layers") and use_layer in adata.layers):
-            X = adata.layers[use_layer]
+            X_raw = adata.layers[use_layer]
         else:
-            X = adata.X
-        X_np = _to_writable_float32_ndarray(X)
-        self.X = torch.tensor(X_np, dtype=torch.float32)
-
+            X_raw = adata.X
+        X_raw_np = _to_writable_float32_ndarray(X_raw)
+        self.X_raw = torch.tensor(X_raw_np, dtype=torch.float32)
+        
+        # 2. Preprocessed features for encoder (🔥 新增)
+        if encoder_layer and (hasattr(adata, "layers") and encoder_layer in adata.layers):
+            X_encoder = adata.layers[encoder_layer]
+        else:
+            # 默认：如果没指定 encoder_layer，就用 raw counts（退化到原始行为）
+            X_encoder = X_raw
+        
+        X_encoder_np = _to_writable_float32_ndarray(X_encoder)
+        self.X_encoder = torch.tensor(X_encoder_np, dtype=torch.float32)
+        
         # 全局索引
-        self.indices = torch.arange(self.X.shape[0], dtype=torch.long)
-
+        self.indices = torch.arange(self.X_raw.shape[0], dtype=torch.long)
+        
         # 空间坐标（可选）
         self.spatial = None
         if hasattr(adata, "obsm") and spatial_key in adata.obsm:
             spatial_np = np.array(adata.obsm[spatial_key], dtype=np.float32, copy=True, order="C")
             self.spatial = torch.tensor(spatial_np, dtype=torch.float32)
-
+    
     def __len__(self):
-        return self.X.shape[0]
-
+        return self.X_raw.shape[0]
+    
     def __getitem__(self, idx):
         item = {
-            "X": self.X[idx],
+            "X": self.X_raw[idx],              # 🔥 raw counts for likelihood
+            "X_encoder": self.X_encoder[idx],  # 🔥 preprocessed for encoder
             "ind_x": self.indices[idx],
         }
         if self.spatial is not None:

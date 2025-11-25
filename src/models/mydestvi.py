@@ -134,8 +134,8 @@ class DestVI(nn.Module):
     def forward(self, item, kl_weight=1.0, n_obs=1.0):
         return self.module.forward(item, kl_weight, n_obs)
 
-    def attach_full_X(self, adata, layer=None):
-        return self.module.attach_full_X(adata, layer)
+    def attach_full_X(self, adata, layer=None, encoder_layer=None):  # 🔥 新增
+        return self.module.attach_full_X(adata, layer, encoder_layer)
 
     def attach_dual_graph(self, adata, k_spatial=6, k_expr=10, spatial_key='spatial'):  # 🔥 新增
         return self.module.attach_dual_graph(adata, k_spatial, k_expr, spatial_key)

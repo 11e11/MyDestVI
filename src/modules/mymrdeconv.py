@@ -169,14 +169,14 @@ class MRDeconv(nn.Module):
                     )
                 
                 # gamma 分支的双图编码器
-                self.gamma_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
-                self.gamma_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                self.gamma_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=4)
+                self.gamma_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=3)
                 self.gamma_spatial_ln = nn.LayerNorm(hidden)
                 self.gamma_expr_ln = nn.LayerNorm(hidden)
                 
                 # V 分支的双图编码器
-                self.V_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
-                self.V_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                self.V_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=4)
+                self.V_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=3)
                 self.V_spatial_ln = nn.LayerNorm(hidden)
                 self.V_expr_ln = nn.LayerNorm(hidden)
                 
@@ -202,9 +202,9 @@ class MRDeconv(nn.Module):
                 # 双图的 buffer（用于缓存图结构）
                 self.register_buffer("_X_all", torch.empty(0), persistent=False)
                 self.register_buffer("_spatial_edge_index", torch.empty((2, 0), dtype=torch.long), persistent=False)
-                self.register_buffer("_spatial_edge_weight", torch.empty(0, dtype=torch.float32), persistent=False)
+                self.register_buffer("_spatial_edge_attr", torch.empty(0, dtype=torch.float32), persistent=False)
                 self.register_buffer("_expr_edge_index", torch.empty((2, 0), dtype=torch.long), persistent=False)
-                self.register_buffer("_expr_edge_weight", torch.empty(0, dtype=torch.float32), persistent=False)
+                self.register_buffer("_expr_edge_attr", torch.empty(0, dtype=torch.float32), persistent=False)
 
         # Dirichlet 先验超参
         if dirichlet_alpha is None:
@@ -267,16 +267,22 @@ class MRDeconv(nn.Module):
         nll = -log_lik.squeeze(0)  # [m]
         return nll
 
-    def generative(self, x: torch.Tensor, ind_x: torch.Tensor):
+    def generative(self, x: torch.Tensor, ind_x: torch.Tensor, x_encoder: torch.Tensor = None):
         """
-        核心生成图（支持双图）
+        核心生成图（支持双图 + 双输入）
+        x: raw counts for likelihood [m, n_genes]
+        x_encoder: preprocessed features for encoder [m, n_genes] (可选)
         """
         m = x.shape[0]
-        library = x.sum(1, keepdim=True)
+        library = x.sum(1, keepdim=True)  # 🔥 用 raw counts 计算 library
         beta = torch.exp(self.beta)
         eps = F.softplus(self.eta)
-
-        x_ = torch.log1p(torch.clamp_min(x, 0.0))
+        
+        # 🔥 关键改动：如果提供了 x_encoder，用它；否则回退到 x
+        if x_encoder is None:
+            x_encoder = x
+        
+        x_ = torch.log1p(torch.clamp_min(x_encoder, 0.0))  # 🔥 用预处理后的特征
 
         # === gamma / v 编码 ===
         if self.use_gat and self.use_dual_graph:
@@ -286,23 +292,22 @@ class MRDeconv(nn.Module):
             if self._spatial_edge_index.numel() == 0 or self._expr_edge_index.numel() == 0:
                 raise RuntimeError("双图模式需要先调用 attach_dual_graph(adata)")
             
-            # 全量数据
-            X_all_log = self._X_all.to(x.device)  # 🔥 不需要再 log1p！ 
+            # 🔥 使用预处理后的全量特征（已在 attach_full_X 中缓存为 log-normalized）
+            X_all_log = self._X_all.to(x.device)
             
             # 边权重
-            # 🔥 边索引和边权重都要移到正确的设备
             spatial_edge_index = self._spatial_edge_index.to(x.device)
-            spatial_attr = self._spatial_edge_weight.to(x.device).unsqueeze(-1)
-
+            spatial_attr = self._spatial_edge_attr.to(x.device)
+            
             expr_edge_index = self._expr_edge_index.to(x.device)
-            expr_attr = self._expr_edge_weight.to(x.device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
+            expr_attr = self._expr_edge_attr.to(x.device) if self._expr_edge_attr.numel() > 0 else None
             
             # === gamma 分支：双图编码 + 融合 ===
-            h_s_gamma = self.gamma_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)  # 🔥 使用新变量
+            h_s_gamma = self.gamma_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)
             h_s_gamma = self.gamma_spatial_ln(h_s_gamma)
             h_s_gamma = F.elu(h_s_gamma)
 
-            h_e_gamma = self.gamma_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)  # 🔥 使用新变量
+            h_e_gamma = self.gamma_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)
             h_e_gamma = self.gamma_expr_ln(h_e_gamma)
             h_e_gamma = F.elu(h_e_gamma)
 
@@ -315,11 +320,11 @@ class MRDeconv(nn.Module):
             gamma_ind = gamma_ind.permute(2, 1, 0)
 
             # === V 分支：双图编码 + 融合 ===
-            h_s_v = self.V_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)  # 🔥 使用新变量
+            h_s_v = self.V_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)
             h_s_v = self.V_spatial_ln(h_s_v)
             h_s_v = F.elu(h_s_v)
 
-            h_e_v = self.V_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)  # 🔥 使用新变量
+            h_e_v = self.V_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)
             h_e_v = self.V_expr_ln(h_e_v)
             h_e_v = F.elu(h_e_v)
 
@@ -328,6 +333,11 @@ class MRDeconv(nn.Module):
             v_all = self.V_output(h_v)
 
             v_ind = F.softplus(v_all[ind_x, :])
+            # print("spat_attr.shape, dtype:", spatial_attr.shape, spatial_attr.dtype)
+            # print("expr_attr.shape, dtype:", expr_attr.shape, expr_attr.dtype)
+            # print("gamma_spatial_gnn.edge_dim:", self.gamma_spatial_gnn.edge_dim)
+            # print("V_spatial_gnn.edge_dim:", self.V_spatial_gnn.edge_dim)
+
             
         else:
             # --- FC 模式（原逻辑）---
@@ -342,14 +352,14 @@ class MRDeconv(nn.Module):
                 v_ind = F.softplus(self.V[:, ind_x].T)
 
         # 解码每个 celltype 的 rate（未乘 library）
-        gamma_mlb = torch.transpose(gamma_ind, 2, 0)            # [m, n_labels, n_latent]
-        px_rate_ct = self._decode_ct(gamma_mlb)                # [m, n_labels, n_genes]
+        gamma_mlb = torch.transpose(gamma_ind, 2, 0)
+        px_rate_ct = self._decode_ct(gamma_mlb)
 
         # 合成 dummy + 各类型
         eps_ct = eps.repeat((m, 1)).view(m, 1, -1)
         r_hat = torch.cat([beta.unsqueeze(0).unsqueeze(1) * px_rate_ct, eps_ct], dim=1)
         px_scale = torch.sum(v_ind.unsqueeze(2) * r_hat, dim=1)
-        px_rate = library * px_scale
+        px_rate = library * px_scale  # 🔥 用 raw counts 的 library 重构
 
         return {
             "px_rate": px_rate,
@@ -364,9 +374,10 @@ class MRDeconv(nn.Module):
         reg_warmup: 对 L1/MMD 的退火权重（0→1）
         """
         x = item["X"]
+        x_encoder = item.get("X_encoder", None)  # 🔥 新增：预处理后的特征
         ind_x = item["ind_x"]
 
-        outs = self.generative(x, ind_x)
+        outs = self.generative(x, ind_x, x_encoder=x_encoder)  # 🔥 传入 x_encoder
         px_rate = outs["px_rate"]
         gamma = outs["gamma"]
         v = outs["v"]
@@ -441,21 +452,19 @@ class MRDeconv(nn.Module):
 
 
     @torch.no_grad()
-    def get_proportions(self, x=None, keep_noise=False):
+    def get_proportions(self, x=None, x_encoder=None, keep_noise=False):
         was_training = self.training
         self.eval()
 
         if self.use_gat and self.use_dual_graph:
             # --- 双图模式 ---
-            # 从模型参数推断设备
             device = next(self.parameters()).device
-            X_all_log = self._X_all.to(device)
+            X_all_log = self._X_all.to(device)  # 已是预处理后的
             
-            # 移动图结构到正确设备
             spatial_edge_index = self._spatial_edge_index.to(device)
-            spatial_attr = self._spatial_edge_weight.to(device).unsqueeze(-1)
+            spatial_attr = self._spatial_edge_attr.to(device)
             expr_edge_index = self._expr_edge_index.to(device)
-            expr_attr = self._expr_edge_weight.to(device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
+            expr_attr = self._expr_edge_attr.to(device) if self._expr_edge_attr.numel() > 0 else None
             
             h_s = self.V_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)
             h_s = self.V_spatial_ln(h_s)
@@ -471,9 +480,11 @@ class MRDeconv(nn.Module):
         
         elif self.amortization in ["both", "proportion"]:
             # --- FC 模式 ---
-            if x is None:
-                raise ValueError("FC 模式需要传入 x")
-            x_ = torch.log1p(x)
+            if x_encoder is None:
+                x_encoder = x
+            if x_encoder is None:
+                raise ValueError("FC 模式需要传入 x 或 x_encoder")
+            x_ = torch.log1p(torch.clamp_min(x_encoder, 0.0))
             res = F.softplus(self.V_encoder(x_))
         else:
             res = F.softplus(self.V)
@@ -489,23 +500,22 @@ class MRDeconv(nn.Module):
         return res
 
     @torch.no_grad()
-    def get_gamma(self, x=None):
+    def get_gamma(self, x=None, x_encoder=None):
         if self.use_gat and self.use_dual_graph:
             # --- 双图模式 ---
-            X_all = torch.clamp_min(self._X_all.to(self.gamma_output.weight.device, dtype=torch.float32), 0.0)
-            X_all_log = self._X_all.to(self.gamma_output.weight.device)  # 🔥 不需要再 log1p！ 
+            device = self.gamma_output.weight.device
+            X_all_log = self._X_all.to(device)
             
-            # 🔥 移动到正确设备
-            spatial_edge_index = self._spatial_edge_index.to(X_all.device)
-            spatial_attr = self._spatial_edge_weight.to(X_all.device).unsqueeze(-1)
-            expr_edge_index = self._expr_edge_index.to(X_all.device)
-            expr_attr = self._expr_edge_weight.to(X_all.device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
+            spatial_edge_index = self._spatial_edge_index.to(device)
+            spatial_attr = self._spatial_edge_attr.to(device)
+            expr_edge_index = self._expr_edge_index.to(device)
+            expr_attr = self._expr_edge_attr.to(device) if self._expr_edge_attr.numel() > 0 else None
 
-            h_s = self.gamma_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)  # 🔥
+            h_s = self.gamma_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)
             h_s = self.gamma_spatial_ln(h_s)
             h_s = F.elu(h_s)
 
-            h_e = self.gamma_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)  # 🔥
+            h_e = self.gamma_expr_gnn(X_all_log, expr_edge_index, edge_attr=expr_attr)
             h_e = self.gamma_expr_ln(h_e)
             h_e = F.elu(h_e)
 
@@ -518,62 +528,86 @@ class MRDeconv(nn.Module):
         
         elif self.amortization in ["latent", "both"]:
             # --- FC 模式 ---
-            if x is None:
-                raise ValueError("FC 模式需要传入 x")
-            x_ = torch.log1p(x)
+            if x_encoder is None:
+                x_encoder = x
+            if x_encoder is None:
+                raise ValueError("FC 模式需要传入 x 或 x_encoder")
+            x_ = torch.log1p(torch.clamp_min(x_encoder, 0.0))
             gamma = self.gamma_encoder(x_)
             return torch.transpose(gamma, 0, 1).reshape((self.n_latent, self.n_labels, -1)).cpu().numpy()
         else:
             return self.gamma.cpu().numpy()
         
-    
-    # def attach_full_X(self, adata, layer=None):
-    #     """
-    #     将全量表达矩阵缓存为 buffer
-    #     """
-    #     from scipy.sparse import issparse
-        
-    #     if layer is not None and layer in getattr(adata, "layers", {}):
-    #         X = adata.layers[layer]
-    #     else:
-    #         X = adata.X
-        
-    #     if issparse(X):
-    #         X = X.toarray()
-    #     X = np.asarray(X, dtype=np.float32)
-        
-    #     self.register_buffer("_X_all", torch.from_numpy(X), persistent=False)
-    #     print(f"✅ 全量 X 已缓存：{X.shape}")
-    #     return self
-    def attach_full_X(self, adata, layer=None):
+
+    def attach_full_X(self, adata, raw_layer=None, encoder_layer=None):
         """
-        将全量表达矩阵缓存为 buffer（带 library size 归一化）
+        缓存全量表达矩阵（用于 GNN encoder）和原始 counts（用于 decoder）。
+        
+        参数：
+        - raw_layer：原始 counts 所在的 layer（用于 NB likelihood）
+        - encoder_layer：预处理好的特征（用于 encoder / GNN）
         """
         from scipy.sparse import issparse
-        
-        if layer is not None and layer in getattr(adata, "layers", {}):
-            X = adata.layers[layer]
+
+        # -------------------------------------------------------------
+        # 1. 获取原始 counts（始终保持用于 decoder，不做预处理）
+        # -------------------------------------------------------------
+        if raw_layer is not None and raw_layer in getattr(adata, "layers", {}):
+            X_raw = adata.layers[raw_layer]
         else:
-            X = adata.X
-        
-        if issparse(X):
-            X = X.toarray()
-        X = np.asarray(X, dtype=np.float32)
-        
-        # 🔥 关键：先做 library size 归一化
-        library_size = X.sum(axis=1, keepdims=True)  # [N, 1]
-        X_normalized = X / (library_size + 1e-6) * 10000  # 归一化到 10000 counts
-        
-        # 🔥 然后 log1p
-        X_log = np.log1p(X_normalized)
-        
-        self.register_buffer("_X_all", torch.from_numpy(X_log), persistent=False)  # 直接缓存 log 后的数据
-        print(f"✅ 全量 X 已缓存（已归一化+log1p）：{X.shape}")
+            X_raw = adata.X
+
+        if issparse(X_raw):
+            X_raw = X_raw.toarray()
+        X_raw = np.asarray(X_raw, dtype=np.float32)
+
+        # 缓存 raw counts（ST decoder reconstruction 用）
+        self.register_buffer("_X_raw", torch.from_numpy(X_raw), persistent=False)
+
+
+        # -------------------------------------------------------------
+        # 2. 获取用于 encoder 的特征（如果没有，就对 raw 做 normalize+log1p）
+        # -------------------------------------------------------------
+        if encoder_layer is not None and encoder_layer in getattr(adata, "layers", {}):
+            # 用户预处理好的特征
+            X_enc = adata.layers[encoder_layer]
+
+            if issparse(X_enc):
+                X_enc = X_enc.toarray()
+            X_enc = np.asarray(X_enc, dtype=np.float32)
+
+            # ❗注意：用户自己处理好的 encoder_layer 不要再 normalize/log1p
+            X_enc_processed = X_enc
+
+            print(f"✅ 已加载 encoder_layer '{encoder_layer}'（不再做归一化/log）")
+
+        else:
+            # 默认：对 raw counts 做 normalize + log1p
+            if issparse(X_raw):
+                X_raw_np = X_raw.toarray()
+            else:
+                X_raw_np = X_raw
+
+            X_raw_np = np.asarray(X_raw_np, dtype=np.float32)
+
+            library = X_raw_np.sum(axis=1, keepdims=True)
+            X_norm = X_raw_np / (library + 1e-6) * 10000
+            X_enc_processed = np.log1p(X_norm)
+
+            print(f"⚠ 未指定 encoder_layer，默认对 raw counts 做 normalize+log1p")
+
+
+        # -------------------------------------------------------------
+        # 3. 缓存 encoder 输入特征（给 GNN）
+        # -------------------------------------------------------------
+        self.register_buffer("_X_all", torch.from_numpy(X_enc_processed), persistent=False)
+        print(f"✅ encoder 特征已缓存：{X_enc_processed.shape}")
+
         return self
 
     def attach_dual_graph(self, adata, k_spatial=6, k_expr=10, spatial_key='spatial'):
         """
-        构建并注册双图结构
+        构建并注册双图结构（确保保存 edge_attr 而非 edge_weight）
         """
         if not getattr(self, 'use_dual_graph', False):
             raise RuntimeError("use_dual_graph=False，请在初始化时设置 use_dual_graph=True")
@@ -582,10 +616,35 @@ class MRDeconv(nn.Module):
         
         graphs = build_dual_graphs(adata, k_spatial=k_spatial, k_expr=k_expr, spatial_key=spatial_key)
         
-        self.register_buffer("_spatial_edge_index", graphs['spatial_edge_index'], persistent=False)
-        self.register_buffer("_spatial_edge_weight", graphs['spatial_edge_weight'], persistent=False)
-        self.register_buffer("_expr_edge_index", graphs['expr_edge_index'], persistent=False)
-        self.register_buffer("_expr_edge_weight", graphs['expr_edge_weight'], persistent=False)
+        # graphs 应包含:
+        # 'spatial_edge_index': torch.tensor([2, E_s])
+        # 'spatial_edge_attr' : numpy/torch array shape (E_s, 4)
+        # 'expr_edge_index'   : torch.tensor([2, E_e])
+        # 'expr_edge_attr'    : numpy/torch array shape (E_e, 3)
         
-        print(f"✅ 双图已注册到模块")
+        # convert and register consistently
+        spat_ei = graphs['spatial_edge_index'].long()
+        spat_eattr = graphs['spatial_edge_attr']
+        expr_ei = graphs['expr_edge_index'].long()
+        expr_eattr = graphs['expr_edge_attr']
+        
+        # if they are numpy arrays, convert
+        if isinstance(spat_eattr, np.ndarray):
+            spat_eattr = torch.from_numpy(spat_eattr.astype(np.float32))
+        else:
+            spat_eattr = spat_eattr.to(torch.float32)
+        
+        if isinstance(expr_eattr, np.ndarray):
+            expr_eattr = torch.from_numpy(expr_eattr.astype(np.float32))
+        else:
+            expr_eattr = expr_eattr.to(torch.float32)
+        
+        # register buffers with consistent names
+        self.register_buffer("_spatial_edge_index", spat_ei, persistent=False)
+        self.register_buffer("_spatial_edge_attr", spat_eattr, persistent=False)
+        self.register_buffer("_expr_edge_index", expr_ei, persistent=False)
+        self.register_buffer("_expr_edge_attr", expr_eattr, persistent=False)
+        
+        # (Optional) print shapes
+        print(f"✅ 双图已注册：spat edges={spat_ei.shape[1]}, spat_attr_dim={spat_eattr.shape[1]}; expr edges={expr_ei.shape[1]}, expr_attr_dim={expr_eattr.shape[1]}")
         return self

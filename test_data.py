@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.data import SingleCellDataset, SpatialDataset
+from src.data.preprocessing import preprocess_sc_st
 from src.models.mycondscvi import CondSCVI
 from src.models.mydestvi import DestVI
 
@@ -29,6 +30,20 @@ python test_data.py \
   --k-expr 10 \
   --log-file ./results/log_dual_graph.txt \
   --prop-csv ./results/mydestvi_predicted_proportions_dual_graph.csv
+
+python test_data.py \
+  --sc-h5ad ../data/PDAC/reference_example.h5ad \
+  --st-h5ad ../data/PDAC/spatial_example.h5ad \
+  --device cuda \
+  --epochs-sc 300 \
+  --epochs-st 1500 \
+  --batch-size 256 \
+  --use-dual-graph \
+  --k-spatial 6 \
+  --k-expr 10 \
+  --log-file ./results/log_dual_graph_PDAC.txt \
+  --prop-csv ./results/mydestvi_predicted_proportions_dual_graph_PDAC.csv \
+  --labels-key "celltype"
 """
 
 def set_seed(seed=0):
@@ -139,7 +154,7 @@ def train_one_epoch_st(module: torch.nn.Module,
 
 
 def main():
-    set_seed(0)
+    set_seed(42)
     parser = argparse.ArgumentParser()
     parser.add_argument("--sc-h5ad", required=True)
     parser.add_argument("--st-h5ad", required=True)
@@ -195,9 +210,40 @@ def main():
     st_adata = sc.read_h5ad(args.st_h5ad)
     log(str(st_adata))
 
+    # ---------- 预处理数据-------------
+    log("预处理 sc 和 st AnnData ...")
+    sc_adata, st_adata, common_genes = preprocess_sc_st(sc_adata, st_adata)   # 可传递具体基因数参数
+    log(f"预处理完毕，交集基因数={len(common_genes)}")
+    # ---------- 预处理 end -------------
+
+    if 'counts' not in st_adata.layers:
+        from scipy.sparse import issparse
+        if issparse(st_adata.X):
+            st_adata.layers['counts'] = st_adata.X.copy()
+        else:
+            st_adata.layers['counts'] = st_adata.X.copy()
+
+    # 2. 创建归一化+log1p 的 layer (用于 encoder)
+    from scipy.sparse import issparse
+    X_raw = st_adata.layers['counts']
+    if issparse(X_raw):
+        X_raw = X_raw.toarray()
+    X_raw = np.asarray(X_raw, dtype=np.float32)
+
+    # Library size normalization
+    library_size = X_raw.sum(axis=1, keepdims=True)
+    X_normalized = X_raw / (library_size + 1e-6) * 10000
+
+    # Log1p
+    X_log = np.log1p(X_normalized)
+
+    # 保存为新 layer
+    st_adata.layers['normalized_log'] = X_log
+    log(f"✅ 已创建 'normalized_log' layer（预处理）")
+
     # 构建数据集
     sc_dataset = SingleCellDataset(sc_adata, label_key=args.labels_key, use_layer=args.layer)
-    st_dataset = SpatialDataset(st_adata, use_layer=args.layer, spatial_key=args.spatial_key)
+    st_dataset = SpatialDataset(st_adata, use_layer=args.layer, encoder_layer='normalized_log', spatial_key=args.spatial_key)
 
     label_names_sc = list(map(str, sc_dataset.label_names))
     cell_type_mapping = np.array(label_names_sc)  # 🔥 改为 numpy 数组（mydestvi.py 需要）
@@ -258,8 +304,8 @@ def main():
     mean_vprior, var_vprior, mp_vprior = cond_model.get_vamp_prior(sc_loader, p=vamp_p, device=device)
 
     # DestVI 参数
-    n_spots = int(st_dataset.X.shape[0])
-    n_genes = int(st_dataset.X.shape[1])
+    n_spots = int(st_dataset.X_raw.shape[0])
+    n_genes = int(st_dataset.X_raw.shape[1])
     n_latent = int(getattr(cond_module, "n_latent", 5))
     n_hidden = int(cond_module.px_decoder[0].in_features)
     n_layers_dec = int(getattr(cond_module, "n_layers", 2))
@@ -304,7 +350,7 @@ def main():
         log("🔥 构建双图结构（空间图 + 表达图）...")
         try:
             # 1. 附加全量 X
-            destvi_model.attach_full_X(st_adata, layer=args.layer)
+            destvi_model.attach_full_X(st_adata, layer=args.layer, encoder_layer='normalized_log')
             
             # 2. 构建并附加双图
             destvi_model.attach_dual_graph(
@@ -343,7 +389,7 @@ def main():
             st_loader,
             st_opt,
             device,
-            st_dataset.X.shape[0],      # n_obs 正确传入
+            st_dataset.X_raw.shape[0],      # n_obs 正确传入
             step_st,                    # start_step
             warmup_steps_kl_st,
             warmup_steps_reg_st
@@ -361,7 +407,7 @@ def main():
             props = dest_module.get_proportions(x=None, keep_noise=False)
         else:
             # FC 模式：需要传入 X
-            X_st_full = st_dataset.X.to(device)
+            X_st_full = st_dataset.X_raw.to(device)
             props = dest_module.get_proportions(x=X_st_full, keep_noise=False)
         
         props_np = props.detach().cpu().numpy() if torch.is_tensor(props) else np.asarray(props)
