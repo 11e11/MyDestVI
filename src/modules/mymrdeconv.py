@@ -279,10 +279,15 @@ class MRDeconv(nn.Module):
         eps = F.softplus(self.eta)
         
         # 🔥 关键改动：如果提供了 x_encoder，用它；否则回退到 x
-        if x_encoder is None:
-            x_encoder = x
+        # if x_encoder is None:
+        #     x_encoder = x
         
-        x_ = torch.log1p(torch.clamp_min(x_encoder, 0.0))  # 🔥 用预处理后的特征
+        # x_ = torch.log1p(torch.clamp_min(x_encoder, 0.0))  # 🔥 用预处理后的特征
+
+        if x_encoder is not None:
+            x_ = x_encoder # ✅ 直接使用，不再 log
+        else:
+            x_ = torch.log1p(torch.clamp_min(x, 0.0))
 
         # === gamma / v 编码 ===
         if self.use_gat and self.use_dual_graph:

@@ -319,8 +319,11 @@ class VAEC(nn.Module):
         scaling = self.ct_weight[labels.view(-1).long()]
         loss = torch.mean(scaling * (reconst_loss + kl_weight * kl_local))
 
+        elbo = torch.mean(reconst_loss + kl_local)
+
         return {
             "loss": loss,
             "reconstruction_loss": reconst_loss.mean(),
             "kl_local": kl_local.mean(),
+            "elbo": elbo
         }

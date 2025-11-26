@@ -7,8 +7,10 @@ from scipy.sparse import issparse
 
 
 def build_spatial_graph(adata, k=6, spatial_key='spatial'):
-    coords = adata.obsm[spatial_key]  # [N,2]
-    
+    coords = adata.obsm[spatial_key].copy()  # [N,2]
+    # 坐标归一化
+    coords = (coords - coords.min(0)) / (coords.max(0) - coords.min(0) + 1e-6)
+
     nbrs = NearestNeighbors(n_neighbors=k+1).fit(coords)
     distances, indices = nbrs.kneighbors(coords)
     

@@ -72,45 +72,107 @@ def set_seed(seed=0):
     # except Exception as e:
     #     print("Warning: deterministic_algorithms not set:", e)
 
+# def preprocess_sc_st(adata_sc, adata_st, sc_n_top_genes=12000, st_n_top_genes=15000, mt_prefixes=("MT.", "MT-")):
+#     """对单细胞和空间数据AnnData对象进行标准预处理
+#     返回：预处理后的 adata_sc, adata_st（会原地修改），以及二者高度变基因交集
+#     """
+#     # ST 预处理
+#     adata_st.var['MT_gene'] = [any(gene.startswith(p) for p in mt_prefixes) for gene in adata_st.var_names]
+#     adata_st = adata_st[:, ~adata_st.var['MT_gene'].values]
+#     sc.pp.filter_cells(adata_st, min_genes=10)
+#     sc.pp.filter_genes(adata_st, min_cells=2)
+#     adata_st.layers['counts'] = adata_st.X.copy()
+#     sc.pp.normalize_total(adata_st)
+#     sc.pp.log1p(adata_st)
+#     adata_st.raw = adata_st
+#     set_seed(42)
+#     sc.pp.highly_variable_genes(
+#         adata_st,
+#         n_top_genes=st_n_top_genes,
+#         layer="counts",
+#         flavor="seurat_v3",
+#         span=1
+#     )
+#     adata_st = adata_st[:, adata_st.var.highly_variable].copy()
+
+#     # SC 预处理
+#     adata_sc.var['MT_gene'] = [any(gene.startswith(p) for p in mt_prefixes) for gene in adata_sc.var_names]
+#     adata_sc = adata_sc[:, ~adata_sc.var['MT_gene'].values]
+#     sc.pp.filter_cells(adata_sc, min_genes=1)
+#     adata_sc.layers['counts'] = adata_sc.X.copy()
+#     sc.pp.normalize_total(adata_sc)
+#     sc.pp.log1p(adata_sc)
+#     adata_sc.raw = adata_sc
+#     set_seed(42)
+#     sc.pp.highly_variable_genes(
+#         adata_sc,
+#         n_top_genes=sc_n_top_genes
+#     )
+#     adata_sc = adata_sc[:, adata_sc.var.highly_variable].copy()
+
+#     # 计算共同基因（可选，可用于后续对齐）
+#     common_genes = np.intersect1d(adata_sc.var.index, adata_st.var.index)
+#     print(f"sc和st表达矩阵交集基因数: {len(common_genes)}")
+#     return adata_sc, adata_st, common_genes
 def preprocess_sc_st(adata_sc, adata_st, sc_n_top_genes=12000, st_n_top_genes=15000, mt_prefixes=("MT.", "MT-")):
-    """对单细胞和空间数据AnnData对象进行标准预处理
-    返回：预处理后的 adata_sc, adata_st（会原地修改），以及二者高度变基因交集
     """
-    # ST 预处理
+    修改版预处理：只做筛选和对齐，不改变 .X 的数值（保持 Raw Counts）
+    """
+    import numpy as np
+    import scanpy as sc
+    
+    # === 1. ST 数据预处理 ===
+    # 过滤线粒体
     adata_st.var['MT_gene'] = [any(gene.startswith(p) for p in mt_prefixes) for gene in adata_st.var_names]
-    adata_st = adata_st[:, ~adata_st.var['MT_gene'].values]
+    adata_st = adata_st[:, ~adata_st.var['MT_gene'].values].copy()
+    
+    # 基础过滤
     sc.pp.filter_cells(adata_st, min_genes=10)
     sc.pp.filter_genes(adata_st, min_cells=2)
-    adata_st.layers['counts'] = adata_st.X.copy()
-    sc.pp.normalize_total(adata_st)
-    sc.pp.log1p(adata_st)
-    adata_st.raw = adata_st
-    set_seed(0)
+    
+    # 备份原始计数 (虽然 .X 也是 raw，但保留 layers['counts'] 是个好习惯)
+    if 'counts' not in adata_st.layers:
+        adata_st.layers['counts'] = adata_st.X.copy()
+        
+    # HVG 选择 (Seurat v3 期望输入是 Raw Counts，这正好符合你的需求)
+    # 注意：这里不需要先 normalize，seurat_v3 内部会处理
     sc.pp.highly_variable_genes(
         adata_st,
         n_top_genes=st_n_top_genes,
-        layer="counts",
-        flavor="seurat_v3",
+        flavor="seurat_v3", # 专门针对 count 数据的算法
+        layer="counts",     # 指定使用 raw counts
         span=1
     )
-    adata_st = adata_st[:, adata_st.var.highly_variable]
+    # 仅切片保留 HVG
+    adata_st = adata_st[:, adata_st.var.highly_variable].copy()
 
-    # SC 预处理
+    # === 2. SC 数据预处理 ===
+    # 过滤线粒体
     adata_sc.var['MT_gene'] = [any(gene.startswith(p) for p in mt_prefixes) for gene in adata_sc.var_names]
-    adata_sc = adata_sc[:, ~adata_sc.var['MT_gene'].values]
+    adata_sc = adata_sc[:, ~adata_sc.var['MT_gene'].values].copy()
+    
+    # 基础过滤
     sc.pp.filter_cells(adata_sc, min_genes=1)
-    adata_sc.layers['counts'] = adata_sc.X.copy()
-    sc.pp.normalize_total(adata_sc)
-    sc.pp.log1p(adata_sc)
-    adata_sc.raw = adata_sc
-    set_seed(42)
+    
+    if 'counts' not in adata_sc.layers:
+        adata_sc.layers['counts'] = adata_sc.X.copy()
+        
+    # HVG 选择
     sc.pp.highly_variable_genes(
         adata_sc,
-        n_top_genes=sc_n_top_genes
+        n_top_genes=sc_n_top_genes,
+        flavor="seurat_v3",
+        layer="counts",
+        span=0.3
     )
-    adata_sc = adata_sc[:, adata_sc.var.highly_variable]
+    adata_sc = adata_sc[:, adata_sc.var.highly_variable].copy()
 
-    # 计算共同基因（可选，可用于后续对齐）
+    # === 3. 计算交集并对齐 ===
     common_genes = np.intersect1d(adata_sc.var.index, adata_st.var.index)
     print(f"sc和st表达矩阵交集基因数: {len(common_genes)}")
+    
+    # 🔥 在这里直接切片对齐，确保返回的数据就是对齐好的
+    adata_sc = adata_sc[:, common_genes].copy()
+    adata_st = adata_st[:, common_genes].copy()
+    
     return adata_sc, adata_st, common_genes
