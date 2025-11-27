@@ -136,6 +136,7 @@ def preprocess_sc_st(adata_sc, adata_st, sc_n_top_genes=12000, st_n_top_genes=15
         
     # HVG 选择 (Seurat v3 期望输入是 Raw Counts，这正好符合你的需求)
     # 注意：这里不需要先 normalize，seurat_v3 内部会处理
+    set_seed(0)
     sc.pp.highly_variable_genes(
         adata_st,
         n_top_genes=st_n_top_genes,
@@ -156,7 +157,8 @@ def preprocess_sc_st(adata_sc, adata_st, sc_n_top_genes=12000, st_n_top_genes=15
     
     if 'counts' not in adata_sc.layers:
         adata_sc.layers['counts'] = adata_sc.X.copy()
-        
+    
+    set_seed(0)
     # HVG 选择
     sc.pp.highly_variable_genes(
         adata_sc,

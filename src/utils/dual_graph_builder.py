@@ -7,91 +7,107 @@ from scipy.sparse import issparse
 
 
 def build_spatial_graph(adata, k=6, spatial_key='spatial'):
-    coords = adata.obsm[spatial_key].copy()  # [N,2]
-    # 坐标归一化
-    coords = (coords - coords.min(0)) / (coords.max(0) - coords.min(0) + 1e-6)
-
+    """
+    构建空间邻域图（基于物理坐标）
+    
+    Returns:
+        edge_index: [2, E] 长整型
+        edge_weight: [E] 浮点型（基于距离的 RBF 核）
+    """
+    coords = adata.obsm[spatial_key]
+    
+    # k-NN
     nbrs = NearestNeighbors(n_neighbors=k+1).fit(coords)
     distances, indices = nbrs.kneighbors(coords)
     
     edge_list = []
-    edge_attrs = []   # 多维 edge_attr
+    edge_weights = []
     
     for i in range(len(coords)):
-        neighbors = indices[i, 1:] 
+        neighbors = indices[i, 1:]  # 排除自己
         dists = distances[i, 1:]
         
-        sigma = dists.std() if dists.std() > 1e-6 else 1.0
-        rbf_w = np.exp(-dists**2 / (2 * sigma**2))
+        # RBF 权重
+        sigma = dists.std() if dists.std() > 0 else 1.0
+        weights = np.exp(-dists**2 / (2 * sigma**2))
         
-        for j, dist_ij, w_ij in zip(neighbors, dists, rbf_w):
-            dx = coords[j,0] - coords[i,0]
-            dy = coords[j,1] - coords[i,1]
-            
-            # 构建4维 edge_attr
-            attr = [dist_ij, w_ij, dx, dy]
-            
-            # 无向图：i->j, j->i
-            edge_list.append([i, j])
-            edge_list.append([j, i])
-            edge_attrs.append(attr)
-            edge_attrs.append(attr)
+        for j, w in zip(neighbors, weights):
+            edge_list.extend([[i, j], [j, i]])  # 无向图
+            edge_weights.extend([w, w])
     
     edge_index = torch.tensor(edge_list, dtype=torch.long).t()
-    edge_attr = torch.tensor(edge_attrs, dtype=torch.float32)
+    edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
     
-    return edge_index, edge_attr
+    return edge_index, edge_weight
 
 
-
-def build_expression_graph(adata, k=10, hvg_only=True, n_hvg=2000):
-    X = adata.X.toarray() if issparse(adata.X) else adata.X
+def build_expression_graph(adata, k=10, hvg_only=True, n_hvg=2000, layer='normalized_log'):
+    """
+    构建表达相似图（基于基因表达谱）
     
-    # 选择 HVG
+    Args:
+        hvg_only: 是否只用高变基因计算相似度
+        n_hvg: 高变基因数量
+    
+    Returns:
+        edge_index: [2, E]
+        edge_weight: [E]（余弦相似度）
+    """
+    # # 🔥 优先尝试读取 layer
+    if layer in adata.layers:
+        X = adata.layers[layer]
+        print(f"📊 Building Expression Graph using layer: {layer}")
+    else:
+        X = adata.X
+        print(f"⚠️ Layer {layer} not found, using .X for graph (Check if this is Normalized!)")
+    # X = adata.X.toarray() if issparse(adata.X) else adata.X
+    
+    # 只用 HVG 计算相似度
     if hvg_only:
-        if 'highly_variable' in adata.var:
+        if 'highly_variable' in adata.var.columns:
             hvg_mask = adata.var['highly_variable'].values
         else:
+            # 简单选择方差最大的基因
             variances = np.var(X, axis=0)
-            hvg_idx = np.argsort(variances)[-n_hvg:]
+            hvg_indices = np.argsort(variances)[-n_hvg:]
             hvg_mask = np.zeros(X.shape[1], dtype=bool)
-            hvg_mask[hvg_idx] = True
+            hvg_mask[hvg_indices] = True
         X = X[:, hvg_mask]
     
+    # 计算余弦相似度矩阵
+    n_spots = X.shape[0]
+    edge_list = []
+    edge_weights = []
+    
+    # 批量计算相似度
     sim_matrix = cosine_similarity(X)
     
-    # Pearson
-    corr = np.corrcoef(X)
-    
-    edge_list = []
-    edge_attrs = []
-    
-    for i in range(X.shape[0]):
+    for i in range(n_spots):
+        # 找到相似度 top-k 的邻居（排除自己）
         sims = sim_matrix[i]
-        top_idx = np.argsort(sims)[-(k+1):-1]  # 排除自己
+        top_k_idx = np.argsort(sims)[-(k+1):-1]  # 排除自己
+        top_k_sims = sims[top_k_idx]
         
-        for rank, j in enumerate(top_idx):
-            sim_ij = sims[j]
-            corr_ij = corr[i, j]
-            
-            # 3维 edge_attr
-            attr = [sim_ij, 1 - corr_ij, rank / k]  # rank归一化
-            
-            if i < j:
+        # 只保留相似度 > 阈值的边
+        threshold = 0.3
+        valid_mask = top_k_sims > threshold
+        
+        for j, sim in zip(top_k_idx[valid_mask], top_k_sims[valid_mask]):
+            if i < j:  # 避免重复边
                 edge_list.extend([[i, j], [j, i]])
-                edge_attrs.extend([attr, attr])
+                edge_weights.extend([sim, sim])
     
     if len(edge_list) == 0:
-        return torch.empty((2,0)), torch.empty((0,))
+        # 如果没有边，返回空图
+        return torch.empty((2, 0), dtype=torch.long), torch.empty(0, dtype=torch.float32)
     
     edge_index = torch.tensor(edge_list, dtype=torch.long).t()
-    edge_attr = torch.tensor(edge_attrs, dtype=torch.float32)
+    edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
     
-    return edge_index, edge_attr
+    return edge_index, edge_weight
 
 
-
-def build_dual_graphs(adata, k_spatial=6, k_expr=10, spatial_key='spatial'):
+def build_dual_graphs(adata, k_spatial=6, k_expr=10, spatial_key='spatial', encoder_layer='normalized_log'):
     """
     一键构建双图
     
@@ -103,15 +119,15 @@ def build_dual_graphs(adata, k_spatial=6, k_expr=10, spatial_key='spatial'):
             'expr_edge_weight': [E_e]
         }
     """
-    spatial_ei, spatial_attr = build_spatial_graph(adata, k=k_spatial, spatial_key=spatial_key)
-    expr_ei, expr_attr = build_expression_graph(adata, k=k_expr)
+    spatial_ei, spatial_ew = build_spatial_graph(adata, k=k_spatial, spatial_key=spatial_key)
+    expr_ei, expr_ew = build_expression_graph(adata, k=k_expr, layer=encoder_layer)
     
     print(f"✅ 空间图构建完成：{spatial_ei.shape[1]} 条边")
     print(f"✅ 表达图构建完成：{expr_ei.shape[1]} 条边")
     
     return {
         'spatial_edge_index': spatial_ei,
-        'spatial_edge_attr': spatial_attr,
+        'spatial_edge_weight': spatial_ew,
         'expr_edge_index': expr_ei,
-        'expr_edge_attr': expr_attr
+        'expr_edge_weight': expr_ew
     }

@@ -149,6 +149,7 @@ class MRDeconv(nn.Module):
         else:
             # === GAT/GNN 模式 ===
             from torch_geometric.nn import GINEConv
+            from torch_geometric.nn import GATv2Conv
             
             if not use_dual_graph:
                 # --- 单图模式（你可以后续实现，现在先报错）---
@@ -169,14 +170,48 @@ class MRDeconv(nn.Module):
                     )
                 
                 # gamma 分支的双图编码器
-                self.gamma_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=4)
-                self.gamma_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=3)
+                self.gamma_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                self.gamma_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+
+                # self.gamma_spatial_gnn = GATv2Conv(
+                #     in_channels=in_ch, 
+                #     out_channels=hidden, 
+                #     heads=gat_heads, 
+                #     concat=False,   # 关键：设为 False 表示对多头结果求平均，保持输出维度为 hidden
+                #     edge_dim=1,     # 传入边特征维度
+                #     dropout=0.1     # GAT 通常建议加一点 dropout
+                # )
+                # self.gamma_expr_gnn = GATv2Conv(
+                #     in_channels=in_ch, 
+                #     out_channels=hidden, 
+                #     heads=gat_heads, 
+                #     concat=False, 
+                #     edge_dim=1,
+                #     dropout=0.1
+                # )
+
                 self.gamma_spatial_ln = nn.LayerNorm(hidden)
                 self.gamma_expr_ln = nn.LayerNorm(hidden)
                 
                 # V 分支的双图编码器
-                self.V_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=4)
-                self.V_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=3)
+                self.V_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                self.V_expr_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
+                # self.V_spatial_gnn = GATv2Conv(
+                #     in_channels=in_ch, 
+                #     out_channels=hidden, 
+                #     heads=gat_heads, 
+                #     concat=False, 
+                #     edge_dim=1,
+                #     dropout=0.1
+                # )
+                # self.V_expr_gnn = GATv2Conv(
+                #     in_channels=in_ch, 
+                #     out_channels=hidden, 
+                #     heads=4, 
+                #     concat=False, 
+                #     edge_dim=1,
+                #     dropout=0.1
+                # )
                 self.V_spatial_ln = nn.LayerNorm(hidden)
                 self.V_expr_ln = nn.LayerNorm(hidden)
                 
@@ -302,10 +337,10 @@ class MRDeconv(nn.Module):
             
             # 边权重
             spatial_edge_index = self._spatial_edge_index.to(x.device)
-            spatial_attr = self._spatial_edge_attr.to(x.device)
+            spatial_attr = self._spatial_edge_weight.to(x.device).unsqueeze(-1)
             
             expr_edge_index = self._expr_edge_index.to(x.device)
-            expr_attr = self._expr_edge_attr.to(x.device) if self._expr_edge_attr.numel() > 0 else None
+            expr_attr = self._expr_edge_weight.to(x.device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
             
             # === gamma 分支：双图编码 + 融合 ===
             h_s_gamma = self.gamma_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)
@@ -467,9 +502,9 @@ class MRDeconv(nn.Module):
             X_all_log = self._X_all.to(device)  # 已是预处理后的
             
             spatial_edge_index = self._spatial_edge_index.to(device)
-            spatial_attr = self._spatial_edge_attr.to(device)
+            spatial_attr = self._spatial_edge_weight.to(device).unsqueeze(-1)
             expr_edge_index = self._expr_edge_index.to(device)
-            expr_attr = self._expr_edge_attr.to(device) if self._expr_edge_attr.numel() > 0 else None
+            expr_attr = self._expr_edge_weight.to(device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
             
             h_s = self.V_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)
             h_s = self.V_spatial_ln(h_s)
@@ -512,9 +547,9 @@ class MRDeconv(nn.Module):
             X_all_log = self._X_all.to(device)
             
             spatial_edge_index = self._spatial_edge_index.to(device)
-            spatial_attr = self._spatial_edge_attr.to(device)
+            spatial_attr = self._spatial_edge_weight.to(device).unsqueeze(-1)
             expr_edge_index = self._expr_edge_index.to(device)
-            expr_attr = self._expr_edge_attr.to(device) if self._expr_edge_attr.numel() > 0 else None
+            expr_attr = self._expr_edge_weight.to(device).unsqueeze(-1) if self._expr_edge_weight.numel() > 0 else None
 
             h_s = self.gamma_spatial_gnn(X_all_log, spatial_edge_index, edge_attr=spatial_attr)
             h_s = self.gamma_spatial_ln(h_s)
@@ -612,7 +647,7 @@ class MRDeconv(nn.Module):
 
     def attach_dual_graph(self, adata, k_spatial=6, k_expr=10, spatial_key='spatial'):
         """
-        构建并注册双图结构（确保保存 edge_attr 而非 edge_weight）
+        构建并注册双图结构
         """
         if not getattr(self, 'use_dual_graph', False):
             raise RuntimeError("use_dual_graph=False，请在初始化时设置 use_dual_graph=True")
@@ -621,35 +656,10 @@ class MRDeconv(nn.Module):
         
         graphs = build_dual_graphs(adata, k_spatial=k_spatial, k_expr=k_expr, spatial_key=spatial_key)
         
-        # graphs 应包含:
-        # 'spatial_edge_index': torch.tensor([2, E_s])
-        # 'spatial_edge_attr' : numpy/torch array shape (E_s, 4)
-        # 'expr_edge_index'   : torch.tensor([2, E_e])
-        # 'expr_edge_attr'    : numpy/torch array shape (E_e, 3)
+        self.register_buffer("_spatial_edge_index", graphs['spatial_edge_index'], persistent=False)
+        self.register_buffer("_spatial_edge_weight", graphs['spatial_edge_weight'], persistent=False)
+        self.register_buffer("_expr_edge_index", graphs['expr_edge_index'], persistent=False)
+        self.register_buffer("_expr_edge_weight", graphs['expr_edge_weight'], persistent=False)
         
-        # convert and register consistently
-        spat_ei = graphs['spatial_edge_index'].long()
-        spat_eattr = graphs['spatial_edge_attr']
-        expr_ei = graphs['expr_edge_index'].long()
-        expr_eattr = graphs['expr_edge_attr']
-        
-        # if they are numpy arrays, convert
-        if isinstance(spat_eattr, np.ndarray):
-            spat_eattr = torch.from_numpy(spat_eattr.astype(np.float32))
-        else:
-            spat_eattr = spat_eattr.to(torch.float32)
-        
-        if isinstance(expr_eattr, np.ndarray):
-            expr_eattr = torch.from_numpy(expr_eattr.astype(np.float32))
-        else:
-            expr_eattr = expr_eattr.to(torch.float32)
-        
-        # register buffers with consistent names
-        self.register_buffer("_spatial_edge_index", spat_ei, persistent=False)
-        self.register_buffer("_spatial_edge_attr", spat_eattr, persistent=False)
-        self.register_buffer("_expr_edge_index", expr_ei, persistent=False)
-        self.register_buffer("_expr_edge_attr", expr_eattr, persistent=False)
-        
-        # (Optional) print shapes
-        print(f"✅ 双图已注册：spat edges={spat_ei.shape[1]}, spat_attr_dim={spat_eattr.shape[1]}; expr edges={expr_ei.shape[1]}, expr_attr_dim={expr_eattr.shape[1]}")
+        print(f"✅ 双图已注册到模块")
         return self

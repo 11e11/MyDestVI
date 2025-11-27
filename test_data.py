@@ -153,7 +153,7 @@ def train_one_epoch_st(module: torch.nn.Module,
 
 
 def main():
-    set_seed(42)
+    set_seed(0)
     parser = argparse.ArgumentParser()
     parser.add_argument("--sc-h5ad", required=True)
     parser.add_argument("--st-h5ad", required=True)
@@ -337,10 +337,6 @@ def main():
     if px_decoder_state is None and hasattr(cond_module, "px_decoder"):
         px_decoder_state = cond_module.px_decoder.state_dict()
 
-    if not isinstance(decoder_state, dict):
-        raise RuntimeError("decoder_state is None：请确认 CondSCVI 使用固定条件版 VAEC 并已训练，且存在 decoder_backbone")
-    if not isinstance(px_decoder_state, dict):
-        raise RuntimeError("px_decoder_state is None：请确认 CondSCVI.module.px_decoder 存在")
 
     # 计算 VampPrior（p=15）
     log("Computing VampPrior from CondSCVI ...")
@@ -374,7 +370,7 @@ def main():
         var_vprior=var_vprior,
         mp_vprior=mp_vprior,
         # 正则基值（用 reg_warmup 退火）
-        l1_reg=10.0,
+        l1_reg=0.0,
         dirichlet_alpha=0.4,
         dirichlet_mmd_reg=2.0,
         # 🔥 双图参数
