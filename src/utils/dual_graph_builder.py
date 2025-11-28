@@ -2,8 +2,7 @@
 import torch
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy.sparse import issparse
+from torch_geometric.utils import to_undirected 
 
 
 def build_spatial_graph(adata, k=6, spatial_key='spatial'):
@@ -41,69 +40,146 @@ def build_spatial_graph(adata, k=6, spatial_key='spatial'):
     return edge_index, edge_weight
 
 
+# def build_expression_graph(adata, k=10, hvg_only=True, n_hvg=2000, layer='normalized_log'):
+#     """
+#     构建表达相似图（基于基因表达谱）
+    
+#     Args:
+#         hvg_only: 是否只用高变基因计算相似度
+#         n_hvg: 高变基因数量
+    
+#     Returns:
+#         edge_index: [2, E]
+#         edge_weight: [E]（余弦相似度）
+#     """
+#     # # 🔥 优先尝试读取 layer
+#     if layer in adata.layers:
+#         X = adata.layers[layer]
+#         print(f"📊 Building Expression Graph using layer: {layer}")
+#     else:
+#         X = adata.X
+#         print(f"⚠️ Layer {layer} not found, using .X for graph (Check if this is Normalized!)")
+#     # X = adata.X.toarray() if issparse(adata.X) else adata.X
+    
+#     # 只用 HVG 计算相似度
+#     if hvg_only:
+#         if 'highly_variable' in adata.var.columns:
+#             hvg_mask = adata.var['highly_variable'].values
+#         else:
+#             # 简单选择方差最大的基因
+#             variances = np.var(X, axis=0)
+#             hvg_indices = np.argsort(variances)[-n_hvg:]
+#             hvg_mask = np.zeros(X.shape[1], dtype=bool)
+#             hvg_mask[hvg_indices] = True
+#         X = X[:, hvg_mask]
+    
+#     # 计算余弦相似度矩阵
+#     n_spots = X.shape[0]
+#     edge_list = []
+#     edge_weights = []
+    
+#     # 批量计算相似度
+#     sim_matrix = cosine_similarity(X)
+    
+#     for i in range(n_spots):
+#         # 找到相似度 top-k 的邻居（排除自己）
+#         sims = sim_matrix[i]
+#         top_k_idx = np.argsort(sims)[-(k+1):-1]  # 排除自己
+#         top_k_sims = sims[top_k_idx]
+        
+#         # 只保留相似度 > 阈值的边
+#         threshold = 0.3
+#         valid_mask = top_k_sims > threshold
+        
+#         for j, sim in zip(top_k_idx[valid_mask], top_k_sims[valid_mask]):
+#             if i < j:  # 避免重复边
+#                 edge_list.extend([[i, j], [j, i]])
+#                 edge_weights.extend([sim, sim])
+    
+#     if len(edge_list) == 0:
+#         # 如果没有边，返回空图
+#         return torch.empty((2, 0), dtype=torch.long), torch.empty(0, dtype=torch.float32)
+    
+#     edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+#     edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
+    
+#     return edge_index, edge_weight
+
+
+
 def build_expression_graph(adata, k=10, hvg_only=True, n_hvg=2000, layer='normalized_log'):
     """
     构建表达相似图（基于基因表达谱）
-    
-    Args:
-        hvg_only: 是否只用高变基因计算相似度
-        n_hvg: 高变基因数量
-    
-    Returns:
-        edge_index: [2, E]
-        edge_weight: [E]（余弦相似度）
     """
-    # # 🔥 优先尝试读取 layer
+    # 1. 获取数据
     if layer in adata.layers:
         X = adata.layers[layer]
         print(f"📊 Building Expression Graph using layer: {layer}")
     else:
         X = adata.X
         print(f"⚠️ Layer {layer} not found, using .X for graph (Check if this is Normalized!)")
-    # X = adata.X.toarray() if issparse(adata.X) else adata.X
     
-    # 只用 HVG 计算相似度
+    # 确保 X 是 dense 格式，避免 sklearn 或 numpy 在稀疏矩阵上报错
+    # 如果内存不够，这一步可以不做，但 sklearn 的 brute force 最好用 dense
+    if hasattr(X, "toarray"):
+        X = X.toarray()
+
+    # 2. HVG 筛选
     if hvg_only:
         if 'highly_variable' in adata.var.columns:
             hvg_mask = adata.var['highly_variable'].values
         else:
-            # 简单选择方差最大的基因
+            print("⚠️ 'highly_variable' not found, selecting top variance genes...")
             variances = np.var(X, axis=0)
             hvg_indices = np.argsort(variances)[-n_hvg:]
             hvg_mask = np.zeros(X.shape[1], dtype=bool)
             hvg_mask[hvg_indices] = True
         X = X[:, hvg_mask]
     
-    # 计算余弦相似度矩阵
     n_spots = X.shape[0]
-    edge_list = []
-    edge_weights = []
     
-    # 批量计算相似度
-    sim_matrix = cosine_similarity(X)
+    # 3. 快速计算 KNN
+    print("🚀 Using fast NearestNeighbors search...")
+    # algorithm='auto' 通常比 'brute' 更智能，会自动选择 KDTree 或 BallTree（如果适用）
+    nbrs = NearestNeighbors(n_neighbors=k+1, metric='cosine', algorithm='auto')
+    nbrs.fit(X)
     
-    for i in range(n_spots):
-        # 找到相似度 top-k 的邻居（排除自己）
-        sims = sim_matrix[i]
-        top_k_idx = np.argsort(sims)[-(k+1):-1]  # 排除自己
-        top_k_sims = sims[top_k_idx]
-        
-        # 只保留相似度 > 阈值的边
-        threshold = 0.3
-        valid_mask = top_k_sims > threshold
-        
-        for j, sim in zip(top_k_idx[valid_mask], top_k_sims[valid_mask]):
-            if i < j:  # 避免重复边
-                edge_list.extend([[i, j], [j, i]])
-                edge_weights.extend([sim, sim])
+    # distances: [N, k+1], indices: [N, k+1]
+    distances, indices = nbrs.kneighbors(X)
     
-    if len(edge_list) == 0:
-        # 如果没有边，返回空图
+    # 转换距离为相似度 (Cosine Sim = 1 - Cosine Dist)
+    similarities = 1 - distances
+    
+    # 4. 构建边列表 (Vectorized)
+    # 排除第一列（因为第一列通常是自己，dist=0, sim=1）
+    source_nodes = np.repeat(np.arange(n_spots), k)
+    target_nodes = indices[:, 1:].flatten()
+    weights = similarities[:, 1:].flatten()
+    
+    # 5. 阈值过滤
+    threshold = 0.3
+    mask = weights > threshold
+    
+    # 过滤后的数据
+    sources = source_nodes[mask]
+    targets = target_nodes[mask]
+    edge_weights = weights[mask]
+    
+    if len(sources) == 0:
+        print("⚠️ No edges found with current threshold!")
         return torch.empty((2, 0), dtype=torch.long), torch.empty(0, dtype=torch.float32)
-    
-    edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+
+    # 6. 构建 Tensor (修复 Numpy 警告)
+    # 直接用 [arr, arr] 转 tensor 会很慢且报警告，推荐 np.stack
+    edge_index = torch.tensor(np.stack([sources, targets]), dtype=torch.long)
     edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
     
+    # 🔥 关键改进：KNN 图通常是有向的 (A在B的Top10里，但B不一定在A的Top10里)
+    # 图神经网络通常希望图是无向的 (Undirected)。
+    # 如果你需要双向连接，请取消下面这行的注释：
+    edge_index, edge_weight = to_undirected(edge_index, edge_weight, reduce="mean")
+    
+    print(f"✅ Graph built: {edge_index.shape[1]} edges")
     return edge_index, edge_weight
 
 

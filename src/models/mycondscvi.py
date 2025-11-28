@@ -235,7 +235,7 @@ class CondSCVI(nn.Module):
         n_hidden: int = 128,
         n_latent: int = 5,
         n_layers: int = 2,
-        dropout_rate: float = 0.05,
+        dropout_rate: float = 0.1,
         weight_obs: bool = False,
         ct_counts: np.ndarray = None,
         encode_covariates: bool = False,

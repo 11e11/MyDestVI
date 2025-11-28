@@ -114,7 +114,7 @@ def set_seed(seed=0):
 #     common_genes = np.intersect1d(adata_sc.var.index, adata_st.var.index)
 #     print(f"sc和st表达矩阵交集基因数: {len(common_genes)}")
 #     return adata_sc, adata_st, common_genes
-def preprocess_sc_st(adata_sc, adata_st, sc_n_top_genes=12000, st_n_top_genes=15000, mt_prefixes=("MT.", "MT-")):
+def preprocess_sc_st(adata_sc, adata_st, sc_n_top_genes=15000, st_n_top_genes=15000, mt_prefixes=("MT.", "MT-")):
     """
     修改版预处理：只做筛选和对齐，不改变 .X 的数值（保持 Raw Counts）
     """

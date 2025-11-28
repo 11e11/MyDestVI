@@ -15,6 +15,7 @@ import numpy as np
 
 from src.nn import FCLayers
 from src.distributions.negative_binomial import NegativeBinomial
+from src.utils.dual_graph_attention import DualGraphAttentionFusion
 
 
 class MRDeconv(nn.Module):
@@ -215,18 +216,36 @@ class MRDeconv(nn.Module):
                 self.V_spatial_ln = nn.LayerNorm(hidden)
                 self.V_expr_ln = nn.LayerNorm(hidden)
                 
-                # 融合层（concat 模式）
-                if dual_graph_fusion == "concat":
+                # ===== 🔥 注意力融合模块 =====
+                if dual_graph_fusion == "attention":
+                    # Gamma 分支的注意力融合
+                    self.gamma_fusion = DualGraphAttentionFusion(
+                        hidden_dim=hidden,
+                        num_heads=gat_heads,
+                        dropout=0.1
+                    )
+                    # V 分支的注意力融合
+                    self.V_fusion = DualGraphAttentionFusion(
+                        hidden_dim=hidden,
+                        num_heads=gat_heads,
+                        dropout=0.1
+                    )
+                    fusion_out_dim = hidden  # 注意力融合后维度不变
+                    
+                elif dual_graph_fusion == "concat":
+                    # 原始 concat 方案
                     self.gamma_fusion = nn.Sequential(
                         nn.Linear(hidden * 2, hidden),
                         nn.ReLU(),
-                        nn.Dropout(p=0.1)
+                        nn. Dropout(p=0.1)
                     )
                     self.V_fusion = nn.Sequential(
                         nn.Linear(hidden * 2, hidden),
-                        nn.ReLU(),
-                        nn.Dropout(p=0.1)
+                        nn. ReLU(),
+                        nn. Dropout(p=0.1)
                     )
+                    fusion_out_dim = hidden
+                    
                 else:
                     raise NotImplementedError(f"fusion={dual_graph_fusion} 未实现")
                 
@@ -240,6 +259,8 @@ class MRDeconv(nn.Module):
                 self.register_buffer("_spatial_edge_attr", torch.empty(0, dtype=torch.float32), persistent=False)
                 self.register_buffer("_expr_edge_index", torch.empty((2, 0), dtype=torch.long), persistent=False)
                 self.register_buffer("_expr_edge_attr", torch.empty(0, dtype=torch.float32), persistent=False)
+
+                self.dual_graph_fusion = dual_graph_fusion
 
         # Dirichlet 先验超参
         if dirichlet_alpha is None:
@@ -312,12 +333,6 @@ class MRDeconv(nn.Module):
         library = x.sum(1, keepdim=True)  # 🔥 用 raw counts 计算 library
         beta = torch.exp(self.beta)
         eps = F.softplus(self.eta)
-        
-        # 🔥 关键改动：如果提供了 x_encoder，用它；否则回退到 x
-        # if x_encoder is None:
-        #     x_encoder = x
-        
-        # x_ = torch.log1p(torch.clamp_min(x_encoder, 0.0))  # 🔥 用预处理后的特征
 
         if x_encoder is not None:
             x_ = x_encoder # ✅ 直接使用，不再 log
@@ -351,10 +366,21 @@ class MRDeconv(nn.Module):
             h_e_gamma = self.gamma_expr_ln(h_e_gamma)
             h_e_gamma = F.elu(h_e_gamma)
 
-            h_gamma = torch.cat([h_s_gamma, h_e_gamma], dim=-1)
-            h_gamma = self.gamma_fusion(h_gamma)
-            gamma_all = self.gamma_output(h_gamma)
+            # h_gamma = torch.cat([h_s_gamma, h_e_gamma], dim=-1)
+            # h_gamma = self.gamma_fusion(h_gamma)
+            # gamma_all = self.gamma_output(h_gamma)
 
+            # gamma_mb = gamma_all[ind_x, :]
+            # gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent)
+            # gamma_ind = gamma_ind.permute(2, 1, 0)
+             # 🔥 根据融合方式选择
+            if self.dual_graph_fusion == "attention":
+                h_gamma = self.gamma_fusion(h_s_gamma, h_e_gamma)  # 注意力融合
+            else:
+                h_gamma = torch.cat([h_s_gamma, h_e_gamma], dim=-1)
+                h_gamma = self.gamma_fusion(h_gamma)  # concat 融合
+            
+            gamma_all = self.gamma_output(h_gamma)
             gamma_mb = gamma_all[ind_x, :]
             gamma_ind = gamma_mb.view(m, self.n_labels, self.n_latent)
             gamma_ind = gamma_ind.permute(2, 1, 0)
@@ -368,16 +394,17 @@ class MRDeconv(nn.Module):
             h_e_v = self.V_expr_ln(h_e_v)
             h_e_v = F.elu(h_e_v)
 
-            h_v = torch.cat([h_s_v, h_e_v], dim=-1)
-            h_v = self.V_fusion(h_v)
+            # h_v = torch.cat([h_s_v, h_e_v], dim=-1)
+            # h_v = self.V_fusion(h_v)
+            # 🔥 根据融合方式选择
+            if self.dual_graph_fusion == "attention":
+                h_v = self.V_fusion(h_s_v, h_e_v)  # 注意力融合
+            else:
+                h_v = torch.cat([h_s_v, h_e_v], dim=-1)
+                h_v = self. V_fusion(h_v)  
+            
             v_all = self.V_output(h_v)
-
             v_ind = F.softplus(v_all[ind_x, :])
-            # print("spat_attr.shape, dtype:", spatial_attr.shape, spatial_attr.dtype)
-            # print("expr_attr.shape, dtype:", expr_attr.shape, expr_attr.dtype)
-            # print("gamma_spatial_gnn.edge_dim:", self.gamma_spatial_gnn.edge_dim)
-            # print("V_spatial_gnn.edge_dim:", self.V_spatial_gnn.edge_dim)
-
             
         else:
             # --- FC 模式（原逻辑）---
@@ -490,7 +517,6 @@ class MRDeconv(nn.Module):
 
         return sum_Kxx + sum_Kyy - 2.0 * sum_Kxy
 
-
     @torch.no_grad()
     def get_proportions(self, x=None, x_encoder=None, keep_noise=False):
         was_training = self.training
@@ -514,8 +540,15 @@ class MRDeconv(nn.Module):
             h_e = self.V_expr_ln(h_e)
             h_e = F.elu(h_e)
             
-            h = torch.cat([h_s, h_e], dim=-1)
-            h = self.V_fusion(h)
+            # h = torch.cat([h_s, h_e], dim=-1)
+            # h = self.V_fusion(h)
+            # 🔥 使用对应的融合方式
+            if self.dual_graph_fusion == "attention":
+                h = self.V_fusion(h_s, h_e)
+            else:
+                h = torch. cat([h_s, h_e], dim=-1)
+                h = self.V_fusion(h)
+
             res = F.softplus(self.V_output(h))
         
         elif self.amortization in ["both", "proportion"]:
@@ -559,8 +592,15 @@ class MRDeconv(nn.Module):
             h_e = self.gamma_expr_ln(h_e)
             h_e = F.elu(h_e)
 
-            h = torch.cat([h_s, h_e], dim=-1)
-            h = self.gamma_fusion(h)
+            # h = torch.cat([h_s, h_e], dim=-1)
+            # h = self.gamma_fusion(h)
+             # 🔥 使用对应的融合方式
+            if self.dual_graph_fusion == "attention":
+                h = self. gamma_fusion(h_s, h_e)
+            else:
+                h = torch.cat([h_s, h_e], dim=-1)
+                h = self.gamma_fusion(h)
+
             gamma_all = self.gamma_output(h)
             N = gamma_all.size(0)
             gamma = gamma_all.view(N, self.n_labels, self.n_latent).permute(2, 1, 0)

@@ -302,7 +302,7 @@ def main():
     n_labels = int(sc_dataset.n_labels)
     log(f"Instantiating CondSCVI: n_input={n_input}, n_labels={n_labels}")
     # 单切片 => n_batch=0
-    cond_model = CondSCVI(n_input=n_input, n_labels=n_labels, n_batch=0)
+    cond_model = CondSCVI(n_input=n_input, n_labels=n_labels, n_batch=0, dropout_rate=0.2)
     cond_module = getattr(cond_model, "module", cond_model).to(device)
 
     cond_params = [p for p in cond_module.parameters() if p.requires_grad]
@@ -349,7 +349,7 @@ def main():
     n_latent = int(getattr(cond_module, "n_latent", 5))
     n_hidden = int(cond_module.px_decoder[0].in_features)
     n_layers_dec = int(getattr(cond_module, "n_layers", 2))
-    dropout_dec = float(getattr(cond_module, "dropout_rate", 0.05))
+    dropout_dec = float(getattr(cond_module, "dropout_rate", 0.2))
 
     destvi_kwargs = dict(
         n_spots=n_spots,
@@ -372,7 +372,7 @@ def main():
         # 正则基值（用 reg_warmup 退火）
         l1_reg=0.0,
         dirichlet_alpha=0.4,
-        dirichlet_mmd_reg=2.0,
+        dirichlet_mmd_reg=10.0,
         # 🔥 双图参数
         use_gat=args.use_dual_graph,           # 只有启用双图时才设为 True
         use_dual_graph=args.use_dual_graph,    # 双图开关
