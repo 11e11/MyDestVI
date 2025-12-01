@@ -99,6 +99,7 @@
 #             item['spatial'] = self.spatial[idx]
 #         return item
 """数据集定义（修复 NumPy 只读数组导致的 PyTorch 警告）"""
+from typing import Optional
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -249,3 +250,148 @@ class SpatialDataset(Dataset):
         if self.spatial is not None:
             item["spatial"] = self.spatial[idx]
         return item
+    
+class STDatasetWithPseudo(Dataset):
+    """混合真实 spot 和伪 spot 的数据集"""
+    def __init__(
+        self,
+        adata_st,
+        X_pseudo: Optional[np.ndarray] = None,
+        proportions_pseudo: Optional[np.ndarray] = None,
+        layer: str = None,
+    ):
+        # 真实数据 - raw counts
+        if layer is not None and layer in adata_st.layers:
+            X_real = adata_st. layers[layer]
+        else:
+            X_real = adata_st.X
+        if issparse(X_real):
+            X_real = X_real. toarray()
+        X_real = np.asarray(X_real, dtype=np. float32)
+        
+        # 真实数据 - encoder 特征（normalized_log）
+        if 'normalized_log' in adata_st.layers:
+            X_encoder_real = adata_st.layers['normalized_log']
+            if issparse(X_encoder_real):
+                X_encoder_real = X_encoder_real.toarray()
+            X_encoder_real = np.asarray(X_encoder_real, dtype=np.float32)
+            print(f"✅ 真实数据 encoder 特征范围: [{X_encoder_real. min():.2f}, {X_encoder_real.max():.2f}]")
+        else:
+            X_encoder_real = None
+        
+        self.n_real = X_real.shape[0]
+        
+        # 伪点数据
+        self.use_pseudo = (X_pseudo is not None and proportions_pseudo is not None)
+        if self.use_pseudo:
+            X_pseudo = X_pseudo.astype(np.float32)
+            proportions_pseudo = proportions_pseudo.astype(np.float32)
+            self.n_pseudo = len(X_pseudo)
+            
+            # 🔥 关键：伪点的 encoder 特征（与真实数据完全一致的归一化）
+            library_pseudo = X_pseudo.sum(axis=1, keepdims=True)
+            X_encoder_pseudo = np.log1p(X_pseudo / (library_pseudo + 1e-6) * 10000)
+            
+            # 🔥 验证归一化范围
+            print(f"✅ 伪点 encoder 特征范围: [{X_encoder_pseudo.min():.2f}, {X_encoder_pseudo.max():.2f}]")
+            print(f"✅ 伪点库大小范围: [{library_pseudo.min():.0f}, {library_pseudo.max():.0f}]")
+            
+            # 拼接
+            self.X_all = np.vstack([X_real, X_pseudo])
+            if X_encoder_real is not None:
+                self.X_encoder_all = np.vstack([X_encoder_real, X_encoder_pseudo])
+            else:
+                self.X_encoder_all = None
+            
+            self.proportions_pseudo = proportions_pseudo
+            
+            # 🔥 验证比例矩阵
+            print(f"✅ STDatasetWithPseudo：{self.n_real} 真实 + {self.n_pseudo} 伪点")
+            print(f"   伪点比例矩阵形状: {proportions_pseudo.shape}")
+            print(f"   伪点比例和: {proportions_pseudo.sum(axis=1). mean():.4f} (应接近1. 0)")
+        else:
+            self.X_all = X_real
+            self.X_encoder_all = X_encoder_real
+            self.n_pseudo = 0
+            self.proportions_pseudo = None
+        
+        self.n_total = len(self.X_all)
+    
+    def __len__(self):
+        return self.n_total
+    
+    def __getitem__(self, idx):
+        X = torch.from_numpy(self.X_all[idx])
+        ind_x = torch.tensor(idx, dtype=torch.long)
+        
+        if self.X_encoder_all is not None:
+            X_encoder = torch. from_numpy(self.X_encoder_all[idx])
+        else:
+            X_encoder = X
+        
+        item = {
+            "X": X,
+            "X_encoder": X_encoder,
+            "ind_x": ind_x,
+        }
+        
+        if idx < self.n_real:
+            item["is_pseudo"] = torch.tensor(0, dtype=torch.long)
+        else:
+            pseudo_idx = idx - self.n_real
+            item["is_pseudo"] = torch.tensor(1, dtype=torch.long)
+            item["pseudo_proportion"] = torch.from_numpy(self.proportions_pseudo[pseudo_idx])
+        
+        return item
+    
+def collate_fn_with_pseudo(batch):
+    """
+    自定义 collate 函数，处理伪点的可选字段
+    """
+    X = torch.stack([item["X"] for item in batch])
+    X_encoder = torch.stack([item["X_encoder"] for item in batch]) if "X_encoder" in batch[0] else None
+    ind_x = torch.stack([item["ind_x"] for item in batch])
+    is_pseudo = torch.stack([item["is_pseudo"] for item in batch])
+    
+    # 🔥 关键修正：伪点比例处理
+    # 检查 batch 中是否有伪点
+    has_pseudo = any(item. get("is_pseudo", 0) == 1 for item in batch)
+    
+    if has_pseudo:
+        # 获取细胞类型数量（从第一个伪点）
+        n_celltypes = None
+        for item in batch:
+            if item.get("is_pseudo", 0) == 1 and "pseudo_proportion" in item:
+                n_celltypes = item["pseudo_proportion"]. size(0)
+                break
+        
+        if n_celltypes is None:
+            # 如果没有找到伪点的比例信息，说明数据有问题
+            raise ValueError("Found is_pseudo=1 but no pseudo_proportion in batch")
+        
+        # 为所有样本创建比例张量（真实点用零填充）
+        pseudo_proportions = []
+        for item in batch:
+            if item. get("is_pseudo", 0) == 1 and "pseudo_proportion" in item:
+                pseudo_proportions. append(item["pseudo_proportion"])
+            else:
+                # 真实点：用零张量填充
+                pseudo_proportions.append(torch.zeros(n_celltypes, dtype=torch.float32))
+        
+        pseudo_proportions = torch.stack(pseudo_proportions)
+    else:
+        pseudo_proportions = None
+    
+    result = {
+        "X": X,
+        "ind_x": ind_x,
+        "is_pseudo": is_pseudo,
+    }
+    
+    if X_encoder is not None:
+        result["X_encoder"] = X_encoder
+    
+    if pseudo_proportions is not None:
+        result["pseudo_proportion"] = pseudo_proportions
+    
+    return result

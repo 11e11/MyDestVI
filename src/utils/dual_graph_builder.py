@@ -207,3 +207,94 @@ def build_dual_graphs(adata, k_spatial=6, k_expr=10, spatial_key='spatial', enco
         'expr_edge_index': expr_ei,
         'expr_edge_weight': expr_ew
     }
+def build_dual_graphs_with_pseudo(
+    adata_st,
+    X_pseudo: np.ndarray = None,
+    k_spatial: int = 6,
+    k_expr: int = 10,
+    expr_threshold: float = 0.5,
+    spatial_key: str = "spatial",
+    allow_pseudo_in_graph: bool = False,  # 🔥 新增：控制伪点是否进图
+):
+    """
+    构建双图
+    
+    🔥 新策略：伪点默认不进图（allow_pseudo_in_graph=False）
+    """
+    from scipy.sparse import issparse
+    
+    N_real = adata_st.n_obs
+    
+    # ===== 准备表达特征 =====
+    if 'normalized_log' in adata_st.  layers:
+        X_real = adata_st.layers['normalized_log']
+    else:
+        X_real = adata_st.X
+    
+    if issparse(X_real):
+        X_real = X_real. toarray()
+    X_real = np.asarray(X_real, dtype=np.float32)
+    
+    if X_pseudo is not None and allow_pseudo_in_graph:
+        # 🔥 旧方案：伪点加入图（会导致震荡）
+        N_pseudo = len(X_pseudo)
+        library_pseudo = X_pseudo.sum(axis=1, keepdims=True)
+        X_pseudo_norm = np.log1p(X_pseudo / (library_pseudo + 1e-6) * 10000)
+        X_all_norm = np.vstack([X_real, X_pseudo_norm])
+        N_total = N_real + N_pseudo
+        print(f"⚠️ 伪点加入图模式（可能导致震荡）：{N_real} 真实 + {N_pseudo} 伪点")
+    else:
+        # 🔥 新方案：伪点不进图
+        X_all_norm = X_real
+        N_total = N_real
+        N_pseudo = 0 if X_pseudo is None else len(X_pseudo)
+        if N_pseudo > 0:
+            print(f"✅ 伪点不进图模式（推荐）：{N_real} 真实点用于图，{N_pseudo} 伪点仅用于监督")
+    
+    # ===== 空间图（只连真实点）=====
+    coords = adata_st.obsm[spatial_key]
+    nbrs_spatial = NearestNeighbors(n_neighbors=k_spatial + 1, metric='euclidean').fit(coords)
+    distances_s, indices_s = nbrs_spatial.  kneighbors(coords)
+    
+    src_s, dst_s, weights_s = [], [], []
+    for i in range(N_real):
+        for j in range(1, k_spatial + 1):
+            neighbor = indices_s[i, j]
+            dist = distances_s[i, j]
+            src_s.append(i)
+            dst_s.append(neighbor)
+            sigma = distances_s[:, 1:]. std() if distances_s[:, 1:].std() > 0 else 1.0
+            weights_s.append(np.exp(-dist**2 / (2 * sigma**2)))
+    
+    spatial_edge_index = torch.tensor([src_s, dst_s], dtype=torch.long)
+    spatial_edge_weight = torch.tensor(weights_s, dtype=torch.float32)
+    
+    # ===== 表达图（只连真实点）=====
+    nbrs_expr = NearestNeighbors(n_neighbors=k_expr + 1, metric='cosine').fit(X_all_norm)
+    distances_e, indices_e = nbrs_expr. kneighbors(X_all_norm)
+    
+    src_e, dst_e, weights_e = [], [], []
+    for i in range(N_total):
+        for j in range(1, k_expr + 1):
+            neighbor = indices_e[i, j]
+            dist = distances_e[i, j]
+            if dist < expr_threshold:
+                src_e.append(i)
+                dst_e.append(neighbor)
+                weights_e.append(np.exp(-dist * 2))
+    
+    expr_edge_index = torch.tensor([src_e, dst_e], dtype=torch.long)
+    expr_edge_weight = torch.tensor(weights_e, dtype=torch.float32)
+    
+    print(f"✅ 空间图：{len(src_s)} 条边（只连真实点）")
+    print(f"✅ 表达图：{len(src_e)} 条边（只连真实点）")
+    
+    return {
+        'spatial_edge_index': spatial_edge_index,
+        'spatial_edge_weight': spatial_edge_weight,
+        'expr_edge_index': expr_edge_index,
+        'expr_edge_weight': expr_edge_weight,
+        'N_real': N_real,
+        'N_pseudo': N_pseudo,
+        'N_total': N_real,  # 🔥 图只包含真实点
+    }
