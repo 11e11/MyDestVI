@@ -46,7 +46,6 @@ class MRDeconv(nn.Module):
         gat_heads: int = 4,
         use_dual_graph: bool = False,           # 双图
         dual_graph_fusion: str = "concat",      # 双图融合方式
-        pseudo_reg: float = 0.0,               # 伪点监督正则化权重
         **kwargs,
     ):
         super().__init__()
@@ -68,8 +67,6 @@ class MRDeconv(nn.Module):
         self.use_dual_graph = use_dual_graph
         self.gat_hidden = gat_hidden
         self.gat_heads = gat_heads
-
-        self.pseudo_reg = float(pseudo_reg)
 
         # 冻结的解码器：输入维度 = n_latent + n_labels
         self.decoder = FCLayers(
@@ -109,7 +106,6 @@ class MRDeconv(nn.Module):
 
         # NB logits
         self.register_buffer("px_r", torch.tensor(px_r, dtype=torch.float32))
-        
 
         # 可学习参数
         self.V = nn.Parameter(torch.randn(n_labels + 1, n_spots))
@@ -173,21 +169,6 @@ class MRDeconv(nn.Module):
                         nn.Dropout(p=0.1),
                         nn.Linear(hidden, out_dim),
                     )
-                # 🔥 强制保留 FC encoder（用于伪点监督）
-                if self.amortization in ["both", "proportion"]:
-                    self.V_encoder = nn.Sequential(
-                        FCLayers(
-                            n_in=n_genes,
-                            n_out=n_hidden,
-                            n_layers=2,
-                            n_hidden=n_hidden,
-                            dropout_rate=dropout_amortization,
-                            use_batch_norm=False,
-                            use_layer_norm=True,
-                        ),
-                        nn.Linear(n_hidden, n_labels + 1),
-                    )
-                    print("✅ 保留 FC V_encoder（用于伪点监督）")
                 
                 # gamma 分支的双图编码器
                 self.gamma_spatial_gnn = GINEConv(mlp_block(in_ch, hidden), train_eps=True, edge_dim=1)
@@ -265,6 +246,14 @@ class MRDeconv(nn.Module):
                     )
                     fusion_out_dim = hidden
                     
+                elif dual_graph_fusion == "gate":
+                    # 输入维度改为 hidden*2，因为我们要拼接 h_s 和 h_e
+                    self.gamma_fusion = nn.Linear(hidden * 2, hidden)
+                    self.V_fusion = nn.Linear(hidden * 2, hidden)
+
+                    # gate 初始 bias = 0，让初始时 h_s 与 h_e 贡献均等
+                    self.gamma_fusion.bias.data.fill_(0.0)
+                    self.V_fusion.bias.data.fill_(0.0)
                 else:
                     raise NotImplementedError(f"fusion={dual_graph_fusion} 未实现")
                 
@@ -395,9 +384,13 @@ class MRDeconv(nn.Module):
              # 🔥 根据融合方式选择
             if self.dual_graph_fusion == "attention":
                 h_gamma = self.gamma_fusion(h_s_gamma, h_e_gamma)  # 注意力融合
-            else:
+            elif self.dual_graph_fusion == "concat":
                 h_gamma = torch.cat([h_s_gamma, h_e_gamma], dim=-1)
                 h_gamma = self.gamma_fusion(h_gamma)  # concat 融合
+            else:
+                h_cat_gamma = torch.cat([h_s_gamma, h_e_gamma], dim=-1)  # [N, hidden*2]
+                g_gamma = torch.sigmoid(self.gamma_fusion(h_cat_gamma))   # [N, hidden], 0~1
+                h_gamma = g_gamma * h_s_gamma + (1.0 - g_gamma) * h_e_gamma
             
             gamma_all = self.gamma_output(h_gamma)
             gamma_mb = gamma_all[ind_x, :]
@@ -418,9 +411,13 @@ class MRDeconv(nn.Module):
             # 🔥 根据融合方式选择
             if self.dual_graph_fusion == "attention":
                 h_v = self.V_fusion(h_s_v, h_e_v)  # 注意力融合
-            else:
+            elif self.dual_graph_fusion == "concat":
                 h_v = torch.cat([h_s_v, h_e_v], dim=-1)
                 h_v = self. V_fusion(h_v)  
+            else:
+                h_cat_v = torch.cat([h_s_v, h_e_v], dim=-1)  # [N, hidden*2]
+                g_v = torch.sigmoid(self.V_fusion(h_cat_v))  # [N, hidden]
+                h_v = g_v * h_s_v + (1.0 - g_v) * h_e_v
             
             v_all = self.V_output(h_v)
             v_ind = F.softplus(v_all[ind_x, :])
@@ -456,125 +453,56 @@ class MRDeconv(nn.Module):
 
     def forward(self, item: dict, kl_weight: float = 1.0, n_obs: float = 1.0, reg_warmup: float = 1.0):
         """
-        支持伪点的 forward（伪点不经过 GNN）
+        kl_weight: 对 gamma 先验项的退火权重（0→1）
+        reg_warmup: 对 L1/MMD 的退火权重（0→1）
         """
         x = item["X"]
-        x_encoder = item. get("X_encoder", None)
+        x_encoder = item.get("X_encoder", None)  # 🔥 新增：预处理后的特征
         ind_x = item["ind_x"]
-        is_pseudo = item. get("is_pseudo", torch.  zeros(x.size(0), dtype=torch.long, device=x.device))
-        pseudo_proportions = item.get("pseudo_proportion", None)
 
-        # 🔥 关键修改：分离真实点和伪点
-        real_mask = (is_pseudo == 0)
-        pseudo_mask = (is_pseudo == 1)
-        n_real = real_mask.sum()
-        n_pseudo = pseudo_mask.sum()
+        outs = self.generative(x, ind_x, x_encoder=x_encoder)  # 🔥 传入 x_encoder
+        px_rate = outs["px_rate"]
+        gamma = outs["gamma"]
+        v = outs["v"]
 
-        # ===== 真实点：正常走 GNN/FC 流程 =====
-        if n_real > 0:
-            x_real = x[real_mask]
-            x_encoder_real = x_encoder[real_mask] if x_encoder is not None else None
-            ind_x_real = ind_x[real_mask]
-            
-            outs_real = self.generative(x_real, ind_x_real, x_encoder=x_encoder_real)
-            px_rate_real = outs_real["px_rate"]
-            gamma_real = outs_real["gamma"]
-            v_real = outs_real["v"]
-        else:
-            px_rate_real = None
-            gamma_real = None
-            v_real = None
+        # 重构
+        reconst_loss = -NegativeBinomial(px_rate, logits=self.px_r).log_prob(x).sum(-1)  # [m]
 
-        # ===== 🔥 伪点：只用 FC encoder 预测比例（不经过 GNN）=====
-        v_pseudo_pred = None
-        if n_pseudo > 0:
-            x_pseudo = x[pseudo_mask]
-            x_encoder_pseudo = x_encoder[pseudo_mask] if x_encoder is not None else None
-            
-            # 准备输入
-            if x_encoder_pseudo is not None:
-                x_pseudo_ = x_encoder_pseudo
-            else:
-                x_pseudo_ = torch.log1p(torch.clamp_min(x_pseudo, 0.0))
-            
-            # 🔥 关键：只用 FC encoder 预测比例（跳过 GNN 和 generative）
-            if self.amortization in ["both", "proportion"]:
-                v_pseudo_logits = self.V_encoder(x_pseudo_)  # [n_pseudo, n_labels+1]
-                v_pseudo_pred = F.softplus(v_pseudo_logits)[:, :self.n_labels]  # 去除noise维度
-                v_pseudo_pred = v_pseudo_pred / (v_pseudo_pred.sum(dim=1, keepdim=True) + 1e-8)
-            else:
-                # 如果没有 V_encoder（非 amortization 模式），无法处理伪点
-                v_pseudo_pred = None
+        # 全局先验（eta/beta）
+        mean_eta = torch.zeros_like(self.eta)
+        scale_eta = torch.ones_like(self.eta)
+        glo_neg_log_likelihood_prior = -self.eta_reg * Normal(mean_eta, scale_eta).log_prob(self.eta).sum()
+        # 用 var(beta)
+        glo_neg_log_likelihood_prior += self.beta_reg * torch.var(self.beta)
 
-        # ===== 只对真实点计算 VAE 损失 =====
-        if n_real > 0:
-            # 重构损失（只用真实点）
-            reconst_loss = -NegativeBinomial(px_rate_real, logits=self.px_r). log_prob(x_real).sum(-1)
+        # L1 稀疏（退火）
+        effective_l1 = self.base_l1_reg * float(reg_warmup)
+        v_sparsity = effective_l1 * torch.abs(v).mean(1)  # [m]
 
-            # 全局先验
-            mean_eta = torch.zeros_like(self.eta)
-            scale_eta = torch.ones_like(self.eta)
-            glo_neg_log_likelihood_prior = -self.eta_reg * Normal(mean_eta, scale_eta).log_prob(self.eta).sum()
-            glo_neg_log_likelihood_prior += self.beta_reg * torch.var(self.beta)
+        # gamma 先验（退火）
+        nll_gamma = self._gamma_prior_nll(gamma)          # [m]
 
-            # gamma 先验
-            nll_gamma = self._gamma_prior_nll(gamma_real)
+        # MMD（退火）
+        effective_mmd = self.base_dirichlet_mmd_reg * float(reg_warmup)
+        mmd_term = torch.tensor(0.0, device=px_rate.device)
+        if effective_mmd > 0.0:
+            v_real = v[:, : self.n_labels]
+            proportions = v_real / (v_real.sum(dim=1, keepdim=True) + 1e-8)
+            alpha = self.dirichlet_alpha.to(proportions.device)
+            dirich = Dirichlet(alpha)
+            theta_prior = dirich.sample((proportions.size(0),)).to(proportions.device)
+            mmd_term = self._mmd_rbf(proportions, theta_prior)
 
-            # L1 稀疏
-            effective_l1 = self.base_l1_reg * float(reg_warmup)
-            v_sparsity = effective_l1 * torch.abs(v_real).mean(1)
-
-            # MMD（只用真实点）
-            effective_mmd = self.base_dirichlet_mmd_reg * float(reg_warmup)
-            mmd_term = torch.tensor(0.0, device=px_rate_real.device)
-            if effective_mmd > 0.0:
-                v_real_only = v_real[:, :self.n_labels]
-                proportions_real = v_real_only / (v_real_only.sum(dim=1, keepdim=True) + 1e-8)
-                alpha = self.dirichlet_alpha. to(proportions_real.device)
-                dirich = Dirichlet(alpha)
-                theta_prior = dirich.sample((proportions_real.size(0),)). to(proportions_real.device)
-                mmd_term = self._mmd_rbf(proportions_real, theta_prior)
-
-            # 真实点的样本损失
-            sample_term_real = reconst_loss + float(kl_weight) * (nll_gamma + v_sparsity)
-            mean_sample_loss_real = torch.mean(sample_term_real)
-        else:
-            mean_sample_loss_real = torch.tensor(0.0, device=x.device)
-            glo_neg_log_likelihood_prior = torch.tensor(0.0, device=x.device)
-            mmd_term = torch.tensor(0.0, device=x. device)
-            reconst_loss = torch.tensor(0.0, device=x.  device)
-            nll_gamma = torch.tensor(0.0, device=x. device)
-
-        # ===== 🔥 伪点监督损失（KL 散度或 MSE）=====
-        pseudo_loss = torch.tensor(0.0, device=x.device)
-        if v_pseudo_pred is not None and pseudo_proportions is not None and n_pseudo > 0:
-            true_proportions = pseudo_proportions[pseudo_mask]. to(v_pseudo_pred.device)
-            
-            # 🔥 方案A：KL 散度（推荐，符合概率分布的距离）
-            pseudo_loss = torch.sum(
-                true_proportions * torch.log((true_proportions + 1e-8) / (v_pseudo_pred + 1e-8)),
-                dim=1
-            ). mean()
-            
-            # 方案B：MSE（备选）
-            # pseudo_loss = torch.mean((v_pseudo_pred - true_proportions) ** 2)
-
-        # 总损失
-        loss = n_obs * (
-            mean_sample_loss_real
-            + glo_neg_log_likelihood_prior
-            + effective_mmd * mmd_term
-        ) + self.pseudo_reg * pseudo_loss
+        # 汇总
+        sample_term = reconst_loss + float(kl_weight) * (nll_gamma + v_sparsity)  # [m]
+        loss = n_obs * (torch.mean(sample_term) + glo_neg_log_likelihood_prior + effective_mmd * mmd_term)
 
         return {
             "loss": loss,
-            "reconstruction_loss": reconst_loss. mean() if n_real > 0 else torch.tensor(0.0, device=x.device),
-            "kl_local": nll_gamma.mean() if n_real > 0 else torch.tensor(0.0, device=x.device),
+            "reconstruction_loss": reconst_loss.mean(),
+            "kl_local": nll_gamma.mean(),
             "kl_global": glo_neg_log_likelihood_prior,
             "mmd": mmd_term,
-            "pseudo_loss": pseudo_loss,
-            "n_real": torch.tensor(n_real, dtype=torch.float32, device=x.device),
-            "n_pseudo": torch. tensor(n_pseudo, dtype=torch.float32, device=x.device),
         }
 
     def _mmd_rbf(self, x, y, sigma=None):
@@ -633,9 +561,14 @@ class MRDeconv(nn.Module):
             # 🔥 使用对应的融合方式
             if self.dual_graph_fusion == "attention":
                 h = self.V_fusion(h_s, h_e)
-            else:
+            elif self.dual_graph_fusion == "concat":
                 h = torch. cat([h_s, h_e], dim=-1)
                 h = self.V_fusion(h)
+            else:
+                h_cat = torch.cat([h_s, h_e], dim=-1)  # [N, hidden*2]
+                g = torch.sigmoid(self.V_fusion(h_cat))  # [N, hidden]
+                h = g * h_s + (1.0 - g) * h_e
+
 
             res = F.softplus(self.V_output(h))
         
