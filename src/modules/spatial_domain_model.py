@@ -578,14 +578,15 @@ class SpatialDomainModel(BaseModuleClass):
         
         return recon_loss
     
+
+    # spatial_domain_model.py 第604-640行
     def contrastive_loss_fast(self, z: torch.Tensor, contrast_samples: dict):
         """加速版对比学习"""
         device = z.device
         n_spots = z.size(0)
         
-        # 随机采样 anchor
         n_sample = max(int(n_spots * self.contrast_sample_rate), 100)
-        sampled_indices = torch.randperm(n_spots, device=device)[:n_sample]. cpu(). numpy()
+        sampled_indices = torch.randperm(n_spots, device=device)[:n_sample].cpu(). numpy()
         
         z_proj = self.contrast_head(z)
         
@@ -595,25 +596,32 @@ class SpatialDomainModel(BaseModuleClass):
         n_valid_global = 0
         
         for i in sampled_indices:
-            anchor = z_proj[i:i+1]
+            anchor = z_proj[i: i+1]
             
             # 局部对比
             local_pos_idx = contrast_samples['local_pos'][i]
             local_neg_idx = contrast_samples['local_neg'][i]
             
-            if len(local_pos_idx) > 0 and len(local_neg_idx) > 0:
+            if len(local_pos_idx) > 0:
                 local_pos = z_proj[local_pos_idx]
-                local_neg = z_proj[local_neg_idx]
                 
-                pos_sim = torch.mm(anchor, local_pos. t()) / self.temperature
-                neg_sim = torch.mm(anchor, local_neg.t()) / self. temperature
+                if len(local_neg_idx) > 0:
+                    # 情况 1：有正样本 + 有负样本 → 标准对比损失
+                    local_neg = z_proj[local_neg_idx]
+                    pos_sim = torch.mm(anchor, local_pos.t()) / self.temperature
+                    neg_sim = torch.mm(anchor, local_neg.t()) / self.temperature
+                    logits = torch.cat([pos_sim.mean(dim=1, keepdim=True), neg_sim], dim=1)
+                    loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=device))
+                else:
+                    # 🔥 情况 2：只有正样本 → 使用 softplus（更稳定）
+                    pos_sim = torch.mm(anchor, local_pos.t()) / self.temperature
+                    # 最小化 softplus(-pos_sim) = 最大化 pos_sim
+                    loss = torch. mean(F.softplus(-pos_sim))
                 
-                logits = torch.cat([pos_sim. mean(dim=1, keepdim=True), neg_sim], dim=1)
-                loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=device))
                 local_loss += loss
                 n_valid_local += 1
             
-            # 全局对比
+            # 全局对比（保持不变）
             global_pos_idx = contrast_samples['global_pos'][i]
             global_neg_idx = contrast_samples['global_neg'][i]
             
@@ -629,15 +637,184 @@ class SpatialDomainModel(BaseModuleClass):
                 global_loss += loss
                 n_valid_global += 1
         
-        local_loss = local_loss / max(n_valid_local, 1)
-        global_loss = global_loss / max(n_valid_global, 1)
+        # 平均损失
+        if n_valid_local > 0:
+            local_loss = local_loss / n_valid_local
+        else:
+            local_loss = torch.tensor(0.0, device=device, dtype=torch. float32)
+        
+        if n_valid_global > 0:
+            global_loss = global_loss / n_valid_global
+        else:
+            global_loss = torch.tensor(0.0, device=device, dtype=torch. float32)
         
         total_contrast_loss = (
-            self.local_contrast_weight * local_loss +
+            self. local_contrast_weight * local_loss +
             self.global_contrast_weight * global_loss
         )
         
         return total_contrast_loss, local_loss, global_loss
+
+    # def contrastive_loss_fast(self, z: torch.Tensor, contrast_samples: dict):
+    #     """加速版对比学习 - 支持只用正样本的局部损失"""
+    #     device = z.device
+    #     n_spots = z.size(0)
+        
+    #     # 随机采样 anchor
+    #     n_sample = max(int(n_spots * self.contrast_sample_rate), 100)
+    #     sampled_indices = torch. randperm(n_spots, device=device)[:n_sample]. cpu().numpy()
+        
+    #     z_proj = self.contrast_head(z)
+        
+    #     local_loss = 0.0
+    #     global_loss = 0.0
+    #     n_valid_local = 0
+    #     n_valid_global = 0
+        
+    #     # ===== for 循环：累加损失 =====
+    #     for i in sampled_indices: 
+    #         anchor = z_proj[i:i+1]
+            
+    #         # 局部对比
+    #         local_pos_idx = contrast_samples['local_pos'][i]
+    #         local_neg_idx = contrast_samples['local_neg'][i]
+            
+    #         if len(local_pos_idx) > 0: 
+    #             local_pos = z_proj[local_pos_idx]
+                
+    #             if len(local_neg_idx) > 0:
+    #                 # 情况 1：有正样本 + 有负样本 → 标准对比损失
+    #                 local_neg = z_proj[local_neg_idx]
+    #                 pos_sim = torch.mm(anchor, local_pos.t()) / self.temperature
+    #                 neg_sim = torch.mm(anchor, local_neg.t()) / self.temperature
+    #                 logits = torch.cat([pos_sim. mean(dim=1, keepdim=True), neg_sim], dim=1)
+    #                 loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=device))
+    #             else:
+    #                 # 情况 2：只有正样本 → 最大化正样本相似度
+    #                 pos_sim = torch.mm(anchor, local_pos.t()) / self.temperature
+    #                 loss = -torch.mean(F.logsigmoid(pos_sim))  # 🔥 改进：用 logsigmoid
+                
+    #             local_loss += loss
+    #             n_valid_local += 1
+            
+    #         # 全局对比
+    #         global_pos_idx = contrast_samples['global_pos'][i]
+    #         global_neg_idx = contrast_samples['global_neg'][i]
+            
+    #         if len(global_pos_idx) > 0 and len(global_neg_idx) > 0:
+    #             global_pos = z_proj[global_pos_idx]
+    #             global_neg = z_proj[global_neg_idx]
+                
+    #             pos_sim = torch. mm(anchor, global_pos. t()) / self.temperature
+    #             neg_sim = torch.mm(anchor, global_neg.t()) / self.temperature
+                
+    #             logits = torch.cat([pos_sim.mean(dim=1, keepdim=True), neg_sim], dim=1)
+    #             loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=device))
+    #             global_loss += loss
+    #             n_valid_global += 1
+        
+    #     # 🔥 关键：在 for 循环外部进行平均和转换
+    #     if n_valid_local > 0:
+    #         local_loss = local_loss / n_valid_local
+    #     else:
+    #         local_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        
+    #     if n_valid_global > 0:
+    #         global_loss = global_loss / n_valid_global
+    #     else:
+    #         global_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        
+    #     total_contrast_loss = (
+    #         self.local_contrast_weight * local_loss +
+    #         self.global_contrast_weight * global_loss
+    #     )
+        
+    #     return total_contrast_loss, local_loss, global_loss
+
+
+    # def contrastive_loss_fast(self, z: torch.Tensor, contrast_samples: dict):
+    #     """加速版对比学习"""
+    #     device = z.device
+    #     n_spots = z.size(0)
+        
+    #     # 随机采样 anchor
+    #     n_sample = max(int(n_spots * self.contrast_sample_rate), 100)
+    #     sampled_indices = torch.randperm(n_spots, device=device)[:n_sample]. cpu(). numpy()
+        
+    #     z_proj = self.contrast_head(z)
+        
+    #     local_loss = 0.0
+    #     global_loss = 0.0
+    #     n_valid_local = 0
+    #     n_valid_global = 0
+        
+    #     for i in sampled_indices:
+    #         anchor = z_proj[i:i+1]
+            
+    #         # 局部对比
+    #         # local_pos_idx = contrast_samples['local_pos'][i]
+    #         # local_neg_idx = contrast_samples['local_neg'][i]
+            
+    #         # if len(local_pos_idx) > 0 and len(local_neg_idx) > 0:
+    #         #     local_pos = z_proj[local_pos_idx]
+    #         #     local_neg = z_proj[local_neg_idx]
+                
+    #         #     pos_sim = torch.mm(anchor, local_pos. t()) / self.temperature
+    #         #     neg_sim = torch.mm(anchor, local_neg.t()) / self. temperature
+                
+    #         #     logits = torch.cat([pos_sim. mean(dim=1, keepdim=True), neg_sim], dim=1)
+    #         #     loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=device))
+    #         #     local_loss += loss
+    #         #     n_valid_local += 1
+    #         # 局部对比
+    #         local_pos_idx = contrast_samples['local_pos'][i]
+    #         local_neg_idx = contrast_samples['local_neg'][i]
+
+    #         # 🔥 新逻辑：只要有正样本就计算损失
+    #         if len(local_pos_idx) > 0: 
+    #             local_pos = z_proj[local_pos_idx]
+                
+    #             if len(local_neg_idx) > 0:
+    #                 # 情况 1：有正样本 + 有负样本 → 标准对比损失
+    #                 local_neg = z_proj[local_neg_idx]
+    #                 pos_sim = torch.mm(anchor, local_pos. t()) / self.temperature
+    #                 neg_sim = torch.mm(anchor, local_neg.t()) / self.temperature
+    #                 logits = torch.cat([pos_sim. mean(dim=1, keepdim=True), neg_sim], dim=1)
+    #                 loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=device))
+    #             else:
+    #                 # 🔥 情况 2：只有正样本 → 最大化正样本相似度
+    #                 pos_sim = torch.mm(anchor, local_pos.t()) / self.temperature
+    #                 loss = -torch.log(torch.sigmoid(pos_sim. mean()))  # 最大化相似度
+                
+    #             local_loss += loss
+    #             n_valid_local += 1
+            
+    #         # 全局对比
+    #         global_pos_idx = contrast_samples['global_pos'][i]
+    #         global_neg_idx = contrast_samples['global_neg'][i]
+            
+    #         if len(global_pos_idx) > 0 and len(global_neg_idx) > 0:
+    #             global_pos = z_proj[global_pos_idx]
+    #             global_neg = z_proj[global_neg_idx]
+                
+    #             pos_sim = torch.mm(anchor, global_pos.t()) / self.temperature
+    #             neg_sim = torch.mm(anchor, global_neg.t()) / self.temperature
+                
+    #             logits = torch.cat([pos_sim.mean(dim=1, keepdim=True), neg_sim], dim=1)
+    #             loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=device))
+    #             global_loss += loss
+    #             n_valid_global += 1
+        
+    #     # 🔥 修改为：转换为 Tensor（即使值为 0）
+    #         local_loss = torch.tensor(local_loss / max(n_valid_local, 1), device=device, dtype=torch.float32)
+    #         global_loss = torch. tensor(global_loss / max(n_valid_global, 1), device=device, dtype=torch.float32)
+        
+    #     total_contrast_loss = (
+    #         self.local_contrast_weight * local_loss +
+    #         self.global_contrast_weight * global_loss
+    #     )
+        
+    #     return total_contrast_loss, local_loss, global_loss
     
     @torch.no_grad()
     def get_latent_representation(self):

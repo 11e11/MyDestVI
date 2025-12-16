@@ -64,7 +64,7 @@ def train_one_epoch_fullgraph(model, X_log, X_raw, contrast_samples, optimizer, 
         return {
             'total_loss': float('inf'),
             'recon_loss': float('inf'),
-            'kl_loss': 0.0,
+            # 'kl_loss': 0.0,
             'contrast_loss': 0.0,
             'local_contrast':  0.0,
             'global_contrast': 0.0,
@@ -72,14 +72,16 @@ def train_one_epoch_fullgraph(model, X_log, X_raw, contrast_samples, optimizer, 
         }
     
     # 2. KL 损失
-    kl_loss = torch.mean(z ** 2) * model.kl_weight
+    # kl_loss = torch.mean(z ** 2) * model.kl_weight
+    # kl_loss = -0.5 * torch.mean(1 + logvar - mu. pow(2) - logvar.exp()) * model.kl_weight
     
     # 3. 对比损失
     contrast_loss, local_loss, global_loss = model.contrastive_loss_fast(z, contrast_samples)
     contrast_loss = contrast_loss * model.contrast_weight
     
     # 总损失
-    total_loss = recon_loss + kl_loss + contrast_loss
+    # total_loss = recon_loss + kl_loss + contrast_loss
+    total_loss = recon_loss + contrast_loss
     
     # 反向传播
     optimizer.zero_grad()
@@ -91,8 +93,8 @@ def train_one_epoch_fullgraph(model, X_log, X_raw, contrast_samples, optimizer, 
     metrics = {
         'total_loss': total_loss.item(),
         'recon_loss': recon_loss.item(),
-        'kl_loss': kl_loss.item(),
-        'contrast_loss': contrast_loss. item(),
+        # 'kl_loss': kl_loss.item(),
+        'contrast_loss': contrast_loss.item(),
         'local_contrast': local_loss.item(),
         'global_contrast': global_loss.item(),
         **gate_info  # 🔥 直接合并，不加前缀
@@ -147,8 +149,13 @@ def main(args):
         sc.pp.log1p(adata)
         adata.layers['normalized_log'] = adata.X.copy()
     
+    # 修改后 (建议方案)
     if 'highly_variable' not in adata.var.columns:
-        sc.pp.highly_variable_genes(adata, n_top_genes=5000)
+        # 指定 layer='counts'，让它去算原始数据
+        sc.pp.highly_variable_genes(adata, n_top_genes=5000, flavor='seurat_v3', layer='counts')
+
+    # 方案A：直接取子集（最简单，推荐）
+    adata = adata[:, adata.var['highly_variable']].copy()
     
     log(f"  样本数:  {adata.n_obs}, 基因数: {adata.n_vars}")
     
@@ -314,7 +321,7 @@ def main(args):
             log(f"{'='*80}")
             log(f"  Total Loss:       {metrics['total_loss']:.4f}")
             log(f"  Recon Loss:      {metrics['recon_loss']:.4f}")
-            log(f"  KL Loss:         {metrics['kl_loss']:.6f}")
+            # log(f"  KL Loss:         {metrics['kl_loss']:.6f}")
             log(f"  Contrast Loss:   {metrics['contrast_loss']:.4f}")
             log(f"    - Local:        {metrics['local_contrast']:.4f}")
             log(f"    - Global:      {metrics['global_contrast']:.4f}")
@@ -470,7 +477,7 @@ def main(args):
     # 保存训练历史
     import pandas as pd
     history_df = pd.DataFrame(history)
-    history_path = Path(args.save_dir) / 'training_history. csv'
+    history_path = Path(args.save_dir) / 'training_history.csv'
     history_df.to_csv(history_path, index=False)
     log(f"  ✅ 保存训练历史到 {history_path}")
 
@@ -1096,10 +1103,10 @@ if __name__ == "__main__":
     
     # 对比学习采样
     parser.add_argument('--local_pos', type=int, default=3, help='局部正样本数')
-    parser.add_argument('--local_neg', type=int, default=5, help='局部负样本数')
+    parser.add_argument('--local_neg', type=int, default=1, help='局部负样本数')
     parser.add_argument('--global_pos', type=int, default=3, help='全局正样本数')
     parser.add_argument('--global_neg1', type=int, default=5, help='全局最不相似负样本数')
-    parser.add_argument('--global_neg2', type=int, default=5, help='全局随机负样本数')
+    parser.add_argument('--global_neg2', type=int, default=2, help='全局随机负样本数')
     parser.add_argument('--local_sim_percentile', type=int, default=60, 
                        help='局部相似度阈值（百分位数）')
     
@@ -1130,11 +1137,11 @@ if __name__ == "__main__":
     
     # 损失权重
     parser.add_argument('--kl_weight', type=float, default=1e-4, help='KL 损失权重')
-    parser.add_argument('--contrast_weight', type=float, default=200, help='对比损失权重')
-    parser.add_argument('--local_contrast_weight', type=float, default=2.0, help='局部对比权重')
+    parser.add_argument('--contrast_weight', type=float, default=20, help='对比损失权重')
+    parser.add_argument('--local_contrast_weight', type=float, default=1.0, help='局部对比权重')
     parser.add_argument('--global_contrast_weight', type=float, default=0.5, help='全局对比权重')
-    parser.add_argument('--temperature', type=float, default=0.07, help='对比学习温度')
-    parser.add_argument('--contrast_sample_rate', type=float, default=0.3, 
+    parser.add_argument('--temperature', type=float, default=0.5, help='对比学习温度')
+    parser.add_argument('--contrast_sample_rate', type=float, default=0.5, 
                        help='对比学习采样率（每次随机采样的anchor比例）')
     
     

@@ -5,40 +5,90 @@ from sklearn.neighbors import NearestNeighbors
 from torch_geometric.utils import to_undirected 
 
 
-def build_spatial_graph(adata, k=6, spatial_key='spatial'):
-    """
-    构建空间邻域图（基于物理坐标）
+# def build_spatial_graph(adata, k=6, spatial_key='spatial'):
+#     """
+#     构建空间邻域图（基于物理坐标）
     
-    Returns:
-        edge_index: [2, E] 长整型
-        edge_weight: [E] 浮点型（基于距离的 RBF 核）
+#     Returns:
+#         edge_index: [2, E] 长整型
+#         edge_weight: [E] 浮点型（基于距离的 RBF 核）
+#     """
+#     coords = adata.obsm[spatial_key]
+    
+#     # k-NN
+#     nbrs = NearestNeighbors(n_neighbors=k+1).fit(coords)
+#     distances, indices = nbrs.kneighbors(coords)
+    
+#     edge_list = []
+#     edge_weights = []
+    
+#     for i in range(len(coords)):
+#         neighbors = indices[i, 1:]  # 排除自己
+#         dists = distances[i, 1:]
+        
+#         # RBF 权重
+#         sigma = dists.std() if dists.std() > 0 else 1.0
+#         weights = np.exp(-dists**2 / (2 * sigma**2))
+        
+#         for j, w in zip(neighbors, weights):
+#             edge_list.extend([[i, j], [j, i]])  # 无向图
+#             edge_weights.extend([w, w])
+    
+#     edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+#     edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
+    
+#     return edge_index, edge_weight
+
+def build_spatial_graph(adata, k=6, spatial_key='spatial', use_global_sigma=True):
+    """
+    构建空间邻域图 - 向量化 + 可选全局/局部 sigma
+    
+    Args:
+        use_global_sigma: 
+            - True: 使用全局 sigma（所有边权重一致的尺度）
+            - False:  使用局部 sigma（考虑每个节点的邻域密度）
     """
     coords = adata.obsm[spatial_key]
+    n_spots = coords.shape[0]
     
-    # k-NN
+    # 1. k-NN 搜索
     nbrs = NearestNeighbors(n_neighbors=k+1).fit(coords)
     distances, indices = nbrs.kneighbors(coords)
     
-    edge_list = []
-    edge_weights = []
+    # 排除自己
+    distances = distances[:, 1:]  # [N, k]
+    indices = indices[: , 1:]      # [N, k]
     
-    for i in range(len(coords)):
-        neighbors = indices[i, 1:]  # 排除自己
-        dists = distances[i, 1:]
-        
-        # RBF 权重
-        sigma = dists.std() if dists.std() > 0 else 1.0
-        weights = np.exp(-dists**2 / (2 * sigma**2))
-        
-        for j, w in zip(neighbors, weights):
-            edge_list.extend([[i, j], [j, i]])  # 无向图
-            edge_weights.extend([w, w])
+    # 2. 计算 RBF 权重
+    if use_global_sigma: 
+        # 🔥 方案 1：全局 sigma（推荐用于空间图）
+        sigma = np.std(distances)  # 标量
+        if sigma == 0:
+            sigma = 1.0
+        weights_matrix = np.exp(-distances**2 / (2 * sigma**2))
+        print(f"  使用全局 sigma: {sigma:.3f}")
+    else:
+        # 🔥 方案 2：局部 sigma（每个节点独立）
+        sigmas = np.std(distances, axis=1)  # [N,]
+        sigmas[sigmas == 0] = 1.0
+        sigmas_expanded = sigmas[:, np.newaxis]  # [N, 1]
+        weights_matrix = np.exp(-distances**2 / (2 * sigmas_expanded**2))
+        print(f"  使用局部 sigma: mean={sigmas.mean():.3f}, std={sigmas.std():.3f}")
     
-    edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+    # 3. 构建边列表（向量化）
+    source_nodes = np.repeat(np.arange(n_spots), k)
+    target_nodes = indices. flatten()
+    edge_weights = weights_matrix.flatten()
+    
+    # 4. 转为 Tensor
+    edge_index = torch.tensor(np.stack([source_nodes, target_nodes]), dtype=torch.long)
     edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
     
+    # 5. 转无向图（去重 + 平均权重）
+    edge_index, edge_weight = to_undirected(edge_index, edge_weight, reduce="mean")
+    
+    print(f"✅ Spatial Graph:  {edge_index.shape[1]} edges (k={k})")
     return edge_index, edge_weight
-
 
 # def build_expression_graph(adata, k=10, hvg_only=True, n_hvg=2000, layer='normalized_log'):
 #     """

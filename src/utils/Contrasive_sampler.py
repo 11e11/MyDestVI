@@ -170,23 +170,27 @@ class MultiScaleContrastiveSampler:
         
         return selected
     
+    # def _sample_local_negatives(self, anchor_idx):
+    #     """
+    #     局部负样本：两跳和一跳邻居内不相似的 local_neg 个 Spot
+    #     """
+    #     two_hop_union = self.two_hop_union. get(anchor_idx, [])
+        
+    #     if len(two_hop_union) == 0:
+    #         return np.array([], dtype=np.int64)
+        
+    #     # 计算相似度
+    #     similarities = self. expr_sim_matrix[anchor_idx, two_hop_union]
+        
+    #     # 选择相似度最低的 local_neg 个
+    #     n_select = min(self.local_neg, len(two_hop_union))
+    #     neg_indices = np.argsort(similarities)[:n_select]
+        
+    #     return np.array(two_hop_union)[neg_indices]
+    
     def _sample_local_negatives(self, anchor_idx):
-        """
-        局部负样本：两跳和一跳邻居内不相似的 local_neg 个 Spot
-        """
-        two_hop_union = self.two_hop_union. get(anchor_idx, [])
-        
-        if len(two_hop_union) == 0:
-            return np.array([], dtype=np.int64)
-        
-        # 计算相似度
-        similarities = self. expr_sim_matrix[anchor_idx, two_hop_union]
-        
-        # 选择相似度最低的 local_neg 个
-        n_select = min(self.local_neg, len(two_hop_union))
-        neg_indices = np.argsort(similarities)[:n_select]
-        
-        return np.array(two_hop_union)[neg_indices]
+        """简化：不使用局部负样本"""
+        return np.array([], dtype=np.int64)
     
     def _sample_global_positives(self, anchor_idx):
         """
