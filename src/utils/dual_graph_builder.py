@@ -157,85 +157,109 @@ def build_spatial_graph(adata, k=6, spatial_key='spatial', use_global_sigma=True
 
 
 
-def build_expression_graph(adata, k=10, hvg_only=True, n_hvg=2000, layer='normalized_log'):
+def build_expression_graph(adata, k=10, use_rep='X_pca', n_pcs=50):
     """
-    构建表达相似图（基于基因表达谱）
-    """
-    # 1. 获取数据
-    if layer in adata.layers:
-        X = adata.layers[layer]
-        print(f"📊 Building Expression Graph using layer: {layer}")
-    else:
-        X = adata.X
-        print(f"⚠️ Layer {layer} not found, using .X for graph (Check if this is Normalized!)")
+    🔥 改进：使用 PCA 表示构建表达相似图
     
-    # 确保 X 是 dense 格式，避免 sklearn 或 numpy 在稀疏矩阵上报错
-    # 如果内存不够，这一步可以不做，但 sklearn 的 brute force 最好用 dense
-    if hasattr(X, "toarray"):
-        X = X.toarray()
-
-    # 2. HVG 筛选
-    if hvg_only:
-        if 'highly_variable' in adata.var.columns:
-            hvg_mask = adata.var['highly_variable'].values
+    Args:
+        adata: AnnData 对象
+        k: 邻居数量
+        use_rep: 使用的表示空间
+            - 'X_pca':  使用 PCA 降维后的数据（推荐）
+            - 'normalized_log':  使用归一化后的 log 数据（原方法）
+        n_pcs: 使用的 PCA 主成分数量（仅当 use_rep='X_pca' 时有效）
+    
+    Returns:
+        edge_index: [2, E]
+        edge_weight: [E]（余弦相似度）
+    """
+    n_spots = adata.n_obs
+    
+    # 🔥 根据 use_rep 选择数据
+    if use_rep == 'X_pca': 
+        if 'X_pca' not in adata.obsm:
+            raise ValueError("adata. obsm 中没有 'X_pca'，请先运行 sc.tl.pca()")
+        
+        X = adata.obsm['X_pca'][: , :n_pcs]
+        print(f"📊 Building Expression Graph using PCA representation ({n_pcs} PCs)")
+    
+    elif use_rep == 'normalized_log':
+        if 'normalized_log' in adata.layers:
+            X = adata. layers['normalized_log']
         else:
-            print("⚠️ 'highly_variable' not found, selecting top variance genes...")
-            variances = np.var(X, axis=0)
-            hvg_indices = np.argsort(variances)[-n_hvg:]
-            hvg_mask = np.zeros(X.shape[1], dtype=bool)
-            hvg_mask[hvg_indices] = True
-        X = X[:, hvg_mask]
+            X = adata.X
+        
+        # 确保 X 是 dense 格式
+        if hasattr(X, "toarray"):
+            X = X. toarray()
+        
+        # HVG 筛选
+        if 'highly_variable' in adata.var.columns:
+            hvg_mask = adata.var['highly_variable']. values
+            X = X[: , hvg_mask]
+            print(f"📊 Building Expression Graph using HVG ({hvg_mask.sum()} genes)")
+        else:
+            print(f"📊 Building Expression Graph using all genes ({X.shape[1]} genes)")
     
-    n_spots = X.shape[0]
+    else:
+        raise ValueError(f"不支持的 use_rep:  {use_rep}")
     
-    # 3. 快速计算 KNN
+    # 快速计算 KNN
     print("🚀 Using fast NearestNeighbors search...")
-    # algorithm='auto' 通常比 'brute' 更智能，会自动选择 KDTree 或 BallTree（如果适用）
     nbrs = NearestNeighbors(n_neighbors=k+1, metric='cosine', algorithm='auto')
     nbrs.fit(X)
     
-    # distances: [N, k+1], indices: [N, k+1]
+    # distances:  [N, k+1], indices: [N, k+1]
     distances, indices = nbrs.kneighbors(X)
     
     # 转换距离为相似度 (Cosine Sim = 1 - Cosine Dist)
     similarities = 1 - distances
     
-    # 4. 构建边列表 (Vectorized)
-    # 排除第一列（因为第一列通常是自己，dist=0, sim=1）
+    # 构建边列表 (Vectorized)
+    # 排除第一列（自己）
     source_nodes = np.repeat(np.arange(n_spots), k)
-    target_nodes = indices[:, 1:].flatten()
-    weights = similarities[:, 1:].flatten()
+    target_nodes = indices[: , 1:].flatten()
+    weights = similarities[: , 1:].flatten()
     
-    # 5. 阈值过滤
-    threshold = 0.3
-    mask = weights > threshold
-    
-    # 过滤后的数据
-    sources = source_nodes[mask]
-    targets = target_nodes[mask]
-    edge_weights = weights[mask]
+    # 🔥 阈值过滤（可选）
+    threshold = 0.0  # 🔥 改为 0，保留所有边（PCA 数据已经去噪）
+    if threshold > 0:
+        mask = weights > threshold
+        sources = source_nodes[mask]
+        targets = target_nodes[mask]
+        edge_weights = weights[mask]
+    else:
+        sources = source_nodes
+        targets = target_nodes
+        edge_weights = weights
     
     if len(sources) == 0:
         print("⚠️ No edges found with current threshold!")
         return torch.empty((2, 0), dtype=torch.long), torch.empty(0, dtype=torch.float32)
-
-    # 6. 构建 Tensor (修复 Numpy 警告)
-    # 直接用 [arr, arr] 转 tensor 会很慢且报警告，推荐 np.stack
-    edge_index = torch.tensor(np.stack([sources, targets]), dtype=torch.long)
-    edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
     
-    # 🔥 关键改进：KNN 图通常是有向的 (A在B的Top10里，但B不一定在A的Top10里)
-    # 图神经网络通常希望图是无向的 (Undirected)。
-    # 如果你需要双向连接，请取消下面这行的注释：
+    # 构建 Tensor
+    edge_index = torch.tensor(np.stack([sources, targets]), dtype=torch.long)
+    edge_weight = torch.tensor(edge_weights, dtype=torch. float32)
+    
+    # 转无向图 (取平均权重)
     edge_index, edge_weight = to_undirected(edge_index, edge_weight, reduce="mean")
     
-    print(f"✅ Graph built: {edge_index.shape[1]} edges")
+    print(f"✅ Expression Graph: {edge_index.shape[1]} edges (k={k})")
     return edge_index, edge_weight
 
 
-def build_dual_graphs(adata, k_spatial=6, k_expr=10, spatial_key='spatial', encoder_layer='normalized_log'):
+def build_dual_graphs(adata, k_spatial=6, k_expr=10, spatial_key='spatial', 
+                     use_pca_for_expr=True, n_pcs=50):
     """
     一键构建双图
+    
+    Args:
+        adata: AnnData 对象
+        k_spatial: 空间图邻居数
+        k_expr: 表达图邻居数
+        spatial_key: 空间坐标在 obsm 中的 key
+        use_pca_for_expr: 🔥 是否使用 PCA 构建表达图（推荐 True）
+        n_pcs: 🔥 使用的 PCA 主成分数量
     
     Returns:
         dict: {
@@ -245,11 +269,31 @@ def build_dual_graphs(adata, k_spatial=6, k_expr=10, spatial_key='spatial', enco
             'expr_edge_weight': [E_e]
         }
     """
-    spatial_ei, spatial_ew = build_spatial_graph(adata, k=k_spatial, spatial_key=spatial_key)
-    expr_ei, expr_ew = build_expression_graph(adata, k=k_expr, layer=encoder_layer)
+    # 构建空间图
+    spatial_ei, spatial_ew = build_spatial_graph(
+        adata, 
+        k=k_spatial, 
+        spatial_key=spatial_key,
+        use_global_sigma=True
+    )
+    
+    # 🔥 构建表达图（使用 PCA 或 HVG）
+    if use_pca_for_expr:
+        expr_ei, expr_ew = build_expression_graph(
+            adata, 
+            k=k_expr, 
+            use_rep='X_pca',
+            n_pcs=n_pcs
+        )
+    else:
+        expr_ei, expr_ew = build_expression_graph(
+            adata, 
+            k=k_expr, 
+            use_rep='normalized_log'
+        )
     
     print(f"✅ 空间图构建完成：{spatial_ei.shape[1]} 条边")
-    print(f"✅ 表达图构建完成：{expr_ei.shape[1]} 条边")
+    print(f"✅ 表达图构建完成：{expr_ei. shape[1]} 条边")
     
     return {
         'spatial_edge_index': spatial_ei,
