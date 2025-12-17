@@ -1,4 +1,5 @@
 """空间域识别训练脚本 - PCA 输入版本"""
+from sklearn.discriminant_analysis import StandardScaler
 import torch
 import numpy as np
 import scanpy as sc
@@ -29,23 +30,23 @@ logging.basicConfig(
 log = logging.info
 
 
-def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, epoch, device):
+def train_one_epoch_fullgraph(model, X_input, X_target, contrast_samples, optimizer, epoch, device):
     """
     全图训练一个 epoch
     
-    Args: 
-        X_pca: PCA 降维数据 (编码器输入) [N, n_pca]
-        X_raw:  原始计数数据 (重构目标) [N, n_genes]
+    Args:  
+        X_input: 编码器输入 (PCA) [N, n_pca]
+        X_target:  解码器目标 (PCA) [N, n_pca]  🔥 与 X_input 相同
     """
     model.train()
     
     # 前向传播
     z, decoder_outputs, gate_info = model.forward_all()
     
-    # 1.重构损失 🔥 只需要原始数据
+    # 1.重构损失（MSE）
     recon_loss = model.compute_reconstruction_loss(
         decoder_outputs=decoder_outputs,
-        x_raw=X_raw
+        x_target=X_target  # 🔥 目标是 PCA
     ).mean()
     
     # 检查 NaN
@@ -53,9 +54,9 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
         log("⚠️ 警告：重构损失为 NaN")
         return {
             'total_loss': float('inf'),
-            'recon_loss': float('inf'),
+            'recon_loss':  float('inf'),
             'contrast_loss': 0.0,
-            'local_contrast':  0.0,
+            'local_contrast': 0.0,
             'global_contrast': 0.0,
             **gate_info
         }
@@ -83,25 +84,12 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
         **gate_info
     }
     
-    # 分布特定统计
-    if model.reconstruction_loss in ['nb', 'zinb']:
-        px_r = torch.exp(model.decoder.px_r)
-        metrics['px_r_mean'] = px_r.mean().item()
-        metrics['px_r_std'] = px_r.std().item()
-    
-    if model.reconstruction_loss == 'zinb':
-        px_dropout_prob = torch.sigmoid(decoder_outputs['px_dropout'])
-        metrics['dropout_mean'] = px_dropout_prob.mean().item()
-    
-    if model.reconstruction_loss == 'gaussian':
-        var = decoder_outputs['var']
-        metrics['var_mean'] = var.mean().item()
-    
     return metrics
 
 def main(args):
+    setup_seed(args.seed)
     log("=" * 80)
-    log("🚀 空间域识别训练 - PCA输入 + NB损失")
+    log("🚀 空间域识别训练 - PCA->PCA + MSE + Euclidean + RBF")
     log("=" * 80)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -110,11 +98,7 @@ def main(args):
     # 1.加载数据
     log("\n📂 加载数据...")
     adata = sc.read_visium(args.adata_path)
-    
-    log(f"  原始数据:  {adata.n_obs} spots × {adata.n_vars} genes")
-    # 1.1 基础过滤
-    sc.pp.filter_genes(adata, min_cells=10)  # 去除在极少 Spot 表达的基因
-    sc.pp.filter_cells(adata, min_counts=10) # 去除几乎没有计数的 Spot (背景)
+    log(f"  原始数据:   {adata.n_obs} spots × {adata.n_vars} genes")
     
     # 保存原始计数
     log("  保存原始计数到 adata.layers['counts']")
@@ -129,12 +113,7 @@ def main(args):
     # 3.筛选高变基因
     if 'highly_variable' not in adata.var.columns:
         log(f"  筛选高变基因 (n_top_genes={args.n_hvg})...")
-        sc.pp.highly_variable_genes(
-            adata, 
-            n_top_genes=args.n_hvg,
-            flavor='seurat_v3', 
-            layer='counts'     
-        )
+        sc.pp.highly_variable_genes(adata, n_top_genes=args.n_hvg, flavor='seurat_v3')
     
     n_hvg = adata.var['highly_variable'].sum()
     log(f"  高变基因数量: {n_hvg}")
@@ -148,27 +127,46 @@ def main(args):
     log(f"\n🔬 在高变基因上执行 PCA 降维到 {args.n_pca} 维...")
     sc.tl.pca(adata_hvg, n_comps=args.n_pca)
     variance_ratio = adata_hvg.uns['pca']['variance_ratio'].sum()
-    log(f"  PCA 解释方差比:  {variance_ratio:.2%}")
+    log(f"  PCA 解释方差比: {variance_ratio:.2%}")
     
-    # 6.将 PCA 结果复制回原始 adata（用于后续可视化）
-    adata.obsm['X_pca'] = adata_hvg.obsm['X_pca']
+    # 🔥 6.标准化 PCA（关键步骤！）
+    log(f"\n📐 标准化 PCA...")
+    from sklearn.preprocessing import StandardScaler
     
-    # 🔥 7.构建双图（直接用 HVG 数据）
-    log("\n📊 构建双图...")
+    X_pca = adata_hvg.obsm['X_pca'][: , :args.n_pca].copy()
+    
+    log(f"  标准化前:")
+    log(f"    - 均值: {X_pca.mean(axis=0)[:5]}")
+    log(f"    - 标准差:  {X_pca.std(axis=0)[:5]}")
+    
+    scaler = StandardScaler()
+    X_pca_scaled = scaler.fit_transform(X_pca)
+    
+    log(f"  标准化后:")
+    log(f"    - 均值: {X_pca_scaled.mean(axis=0)[:5]}")
+    log(f"    - 标准差: {X_pca_scaled.std(axis=0)[:5]}")
+    
+    # 🔥🔥🔥 关键：将标准化后的 PCA 写回 adata，供构图使用 🔥🔥🔥
+    adata_hvg.obsm['X_pca'] = X_pca_scaled.copy()
+    adata.obsm['X_pca'] = X_pca_scaled.copy()  # 也写回原始 adata
+    
+    log(f"  ✅ 标准化 PCA 已写回 adata.obsm['X_pca']")
+    
+    # 🔥 7.构建双图（使用标准化后的 PCA + Euclidean + RBF）
+    log("\n📊 构建双图（基于标准化 PCA + Euclidean + RBF）...")
     graphs = build_dual_graphs(
-        adata_hvg,  # 🔥 直接使用 HVG 数据，不需要替换 layer
+        adata_hvg,  # 🔥 此时 adata_hvg.obsm['X_pca'] 已经是标准化的
         k_spatial=args.k_spatial,
         k_expr=args.k_expr,
         spatial_key=args.spatial_key,
-        # encoder_layer='normalized_log'
-        use_pca_for_expr=True,
+        use_pca_for_expr=True,  # 🔥 使用 PCA 构建表达图
         n_pcs=args.n_pca
     )
     
     # 8.初始化对比学习采样器
     log("\n🎯 初始化对比学习采样器...")
     sampler = MultiScaleContrastiveSampler(
-        adata_hvg,  # 使用 HVG 数据
+        adata_hvg,
         spatial_key=args.spatial_key,
         expr_layer='normalized_log',
         k_spatial=args.k_spatial,
@@ -185,45 +183,29 @@ def main(args):
     
     # 9.准备训练数据
     log("\n📦 准备训练数据...")
-    from scipy.sparse import issparse
     
-    # 1.PCA 数据（编码器输入）
-    X_pca = adata_hvg.obsm['X_pca'][: , :args.n_pca].copy()  # 添加 .copy()
-    X_pca_tensor = torch.FloatTensor(X_pca).to(device)
+    # 🔥 使用标准化后的 PCA
+    X_pca_tensor = torch.FloatTensor(X_pca_scaled).to(device)
     
-    # 2.原始计数数据（重构目标）- 只用 HVG
-    X_raw = adata_hvg.layers['counts']
-    if issparse(X_raw):
-        X_raw = X_raw.toarray()
-    X_raw_tensor = torch.FloatTensor(np.asarray(X_raw, dtype=np.float32)).to(device)
-    
-    log(f"  X_pca 形状: {X_pca_tensor.shape} (编码器输入)")
+    log(f"  X_pca 形状: {X_pca_tensor.shape}")
     log(f"    - 范围: [{X_pca_tensor.min():.2f}, {X_pca_tensor.max():.2f}]")
-    log(f"  X_raw 形状: {X_raw_tensor.shape} (解码器目标)")
-    log(f"    - 范围: [{X_raw_tensor.min():.0f}, {X_raw_tensor.max():.0f}]")
-    log(f"    - Library size: {X_raw_tensor.sum(dim=1).mean():.0f}")
-    
-    # 验证数据类型
-    if args.reconstruction_loss in ['nb', 'zinb', 'poisson']:
-        is_integer = torch.all(X_raw_tensor == X_raw_tensor.floor())
-        if not is_integer: 
-            log(f"  ⚠️ 警告:  原始数据不是整数!")
-            log(f"     前 10 个值: {X_raw_tensor[0, :10]}")
-            raise ValueError("NB/ZINB/Poisson 损失需要整数计数数据")
-        log(f"  ✅ 原始数据验证通过（整数计数）")
+    log(f"    - 均值: {X_pca_tensor.mean():.4f}")
+    log(f"    - 标准差: {X_pca_tensor.std():.4f}")
+    log(f"  🎯 训练目标: 重构标准化的 PCA（MSE 损失）")
+    log(f"  🎯 图结构: 基于标准化 PCA + Euclidean + RBF")
     
     # 10.初始化模型
     log("\n🏗️ 初始化模型...")
     model = SpatialDomainModel(
-        n_input=args.n_pca,              # 输入:  PCA 50 维
-        n_output=adata_hvg.n_vars,       # 输出: HVG 基因数
+        n_input=args.n_pca,
+        n_output=args.n_pca,
         hidden_dim=args.hidden_dim,
         latent_dim=args.latent_dim,
         gnn_type=args.gnn_type,
         n_heads=args.n_heads,
         dropout=args.dropout,
         fusion_type=args.fusion_type,
-        reconstruction_loss=args.reconstruction_loss,
+        reconstruction_loss='gaussian',
         contrast_weight=args.contrast_weight,
         local_contrast_weight=args.local_contrast_weight,
         global_contrast_weight=args.global_contrast_weight,
@@ -231,8 +213,8 @@ def main(args):
         contrast_sample_rate=args.contrast_sample_rate
     ).to(device)
     
-    # 注册图和数据
-    model.attach_full_X(X_pca=X_pca_tensor, X_raw=X_raw_tensor)
+    # 注册数据和图
+    model.attach_full_X(X_pca=X_pca_tensor)
     model.attach_dual_graphs(
         graphs['spatial_edge_index'].to(device),
         graphs['spatial_edge_weight'].to(device),
@@ -268,8 +250,8 @@ def main(args):
         
         metrics = train_one_epoch_fullgraph(
             model,
-            X_pca_tensor,
-            X_raw_tensor,
+            X_pca_tensor,   # 🔥 输入
+            X_pca_tensor,   # 🔥 目标（同一个数据）
             contrast_samples,
             optimizer,
             epoch,
@@ -289,10 +271,10 @@ def main(args):
             log(f"\n{'='*80}")
             log(f"Epoch {epoch+1}/{args.max_epochs} ({epoch_time:.2f}s)")
             log(f"{'='*80}")
-            log(f"  Total Loss:        {metrics['total_loss']:.4f}")
-            log(f"  Recon Loss:      {metrics['recon_loss']:.4f}")
-            log(f"  Contrast Loss:   {metrics['contrast_loss']:.4f}")
-            log(f"    - Local:         {metrics['local_contrast']:.4f}")
+            log(f"  Total Loss:         {metrics['total_loss']:.4f}")
+            log(f"  Recon Loss (MSE):  {metrics['recon_loss']:.4f}")
+            log(f"  Contrast Loss:    {metrics['contrast_loss']:.4f}")
+            log(f"    - Local:          {metrics['local_contrast']:.4f}")
             log(f"    - Global:      {metrics['global_contrast']:.4f}")
             
             if 'gate_spatial_mean' in metrics:
@@ -300,10 +282,7 @@ def main(args):
                 log(f"    - Spatial:      {metrics['gate_spatial_mean']:.3f}")
                 log(f"    - Expression:  {metrics['gate_expr_mean']:.3f}")
             
-            if 'px_r_mean' in metrics:
-                log(f"  Dispersion (θ):  {metrics['px_r_mean']:.3f} ± {metrics['px_r_std']:.3f}")
-            
-            log(f"  LR:               {metrics['lr']:.6f}")
+            log(f"  LR:                {metrics['lr']:.6f}")
         
         # 保存最佳模型
         if metrics['total_loss'] < best_loss:
@@ -322,10 +301,6 @@ def main(args):
             
             if (epoch + 1) % args.log_every == 0:
                 log(f"  ✅ 保存最佳模型 (loss={best_loss:.4f})")
-    
-    log("\n" + "="*80)
-    log("🎉 训练完成！")
-    log("="*80)
     
         # 13.提取 latent 并聚类
     log("\n🔍 提取 latent 表示并聚类...")
@@ -961,6 +936,38 @@ def plot_uncertainty(adata, save_dir, spatial_key='spatial'):
     plt.close()
     log("所有任务完成！")
 
+import random
+import os
+
+def setup_seed(seed=2020):
+    # 1.Python 自身
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # 2.Numpy
+    np.random.seed(seed)
+    
+    # 3.Pytorch CPU/GPU
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # 如果有多张卡
+    
+    # 4.🔥 强制 CuDNN 使用确定性算法
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # 5.🔥 (可选) PyTorch 某些算子的确定性设置
+    # torch.use_deterministic_algorithms(True) # 这行可能会报错，如果某些算子不支持的话先注释掉
+    
+    # 6.🔥 R 语言种子
+    try:
+        import rpy2.robjects as ro
+        ro.r(f'set.seed({seed})')
+    except ImportError:
+        pass
+
+    print(f"🔒 全局随机种子已固定: {seed}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='空间域识别 - PCA输入 + NB损失')
@@ -968,7 +975,7 @@ if __name__ == "__main__":
     # 数据
     parser.add_argument('--adata_path', type=str, required=True)
     parser.add_argument('--spatial_key', type=str, default='spatial')
-    parser.add_argument('--save_dir', type=str, default='./results/spatial_domain_pca')
+    parser.add_argument('--save_dir', type=str, default='./results/spatial_domain')
     
     # 高变基因和 PCA
     parser.add_argument('--n_hvg', type=int, default=3000)
@@ -979,23 +986,23 @@ if __name__ == "__main__":
     parser.add_argument('--k_expr', type=int, default=15)
     
     # 对比学习采样
-    parser.add_argument('--local_pos', type=int, default=3)
+    parser.add_argument('--local_pos', type=int, default=5)
     parser.add_argument('--local_neg', type=int, default=0)
-    parser.add_argument('--global_pos', type=int, default=3)
+    parser.add_argument('--global_pos', type=int, default=5)
     parser.add_argument('--global_neg1', type=int, default=5)
     parser.add_argument('--global_neg2', type=int, default=5)
-    parser.add_argument('--local_sim_percentile', type=int, default=60)
+    parser.add_argument('--local_sim_percentile', type=int, default=70)
     
     # 模型架构
     parser.add_argument('--gnn_type', type=str, default='gine')
     parser.add_argument('--n_heads', type=int, default=4)
-    parser.add_argument('--hidden_dim', type=int, default=256)
-    parser.add_argument('--latent_dim', type=int, default=32) 
+    parser.add_argument('--hidden_dim', type=int, default=128)
+    parser.add_argument('--latent_dim', type=int, default=16) 
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--fusion_type', type=str, default='independent')
     
     # 重构损失
-    parser.add_argument('--reconstruction_loss', type=str, default='nb')  
+    parser.add_argument('--reconstruction_loss', type=str, default='gaussian')  
     
     # 训练
     parser.add_argument('--max_epochs', type=int, default=300)
@@ -1004,11 +1011,11 @@ if __name__ == "__main__":
     parser.add_argument('--log_every', type=int, default=10)
     
     # 损失权重
-    parser.add_argument('--contrast_weight', type=float, default=20) 
+    parser.add_argument('--contrast_weight', type=float, default=5) 
     parser.add_argument('--local_contrast_weight', type=float, default=2.0)
     parser.add_argument('--global_contrast_weight', type=float, default=0.5)
-    parser.add_argument('--temperature', type=float, default=0.1)  
-    parser.add_argument('--contrast_sample_rate', type=float, default=0.5)
+    parser.add_argument('--temperature', type=float, default=0.3)  
+    parser.add_argument('--contrast_sample_rate', type=float, default=0.3)
     
     # 聚类
     parser.add_argument('--n_clusters', type=str, default='7')
