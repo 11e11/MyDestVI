@@ -1,0 +1,54 @@
+============================================================
+评估指标
+============================================================
+
+Ground Truth 列: layer_guess_reordered
+数据路径: ../data/DLPFC/st/151673
+有效样本数: 3611 / 3639 (99.2%)
+
+Ground Truth 分布:
+  Layer1: 273
+  Layer2: 253
+  Layer3: 989
+  Layer4: 218
+  Layer5: 673
+  Layer6: 692
+  WM: 513
+
+预测聚类分布:
+  Cluster 0: 350
+  Cluster 1: 655
+  Cluster 2: 576
+  Cluster 3: 938
+  Cluster 4: 416
+  Cluster 5: 326
+  Cluster 6: 350
+
+聚类评估指标:
+  ARI (Adjusted Rand Index):           0.5453
+  NMI (Normalized Mutual Info):        0.6594
+  AMI (Adjusted Mutual Info):          0.6584
+  FMI (Fowlkes-Mallows Index):         0.6245
+  Homogeneity:                         0.6700
+  Completeness:                          0.6491
+  V-measure:                           0.6594
+
+
+交叉表:
+True       Layer1  Layer2  Layer3  Layer4  Layer5  Layer6   WM
+Predicted                                                     
+0               2       0       0       0       0     156  192
+1               0       0       4       3     145     503    0
+2               0       0       3      57     494      22    0
+3               2       8     735     158      33       2    0
+4               4     184     228       0       0       0    0
+5               0       0       0       0       0       5  321
+6             265      61      19       0       1       4    0
+
+
+指标说明:
+  - ARI: 衡量聚类与真实标签的一致性 (范围: -1 to 1, 越高越好)
+  - NMI: 衡量聚类与真实标签的互信息 (范围: 0 to 1, 越高越好)
+  - AMI: 调整后的互信息 (范围: -1 to 1, 越高越好)
+  - Homogeneity: 每个聚类只包含一个类别 (0 to 1, 越高越好)
+  - Completeness: 同一类别分配到同一聚类 (0 to 1, 越高越好)
