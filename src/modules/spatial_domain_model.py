@@ -249,83 +249,98 @@ class DualGINEncoder(nn.Module):
 
 class UniversalDecoder(nn.Module):
     """
-    通用解码器 - 针对 PCA 重构优化
+    通用解码器 - 优化版本
+    🔥 修改：支持不同的 latent 维度和输出维度
     """
     
     def __init__(
         self,
         latent_dim: int,
-        n_output: int,
+        n_output: int,  # 🔥 新增：输出维度（原始基因数，如 3000）
         hidden_dim: int = 256,
         dropout: float = 0.1,
-        distribution: str = 'gaussian'
+        distribution: str = 'nb'
     ):
         super().__init__()
         
-        self.distribution = distribution. lower()
+        self.distribution = distribution.lower()
         self.n_output = n_output
         
         print(f"📊 解码器配置:")
-        print(f"  - 输出维度: {n_output}")
+        print(f"  - 输出维度: {n_output}")  # 🔥 打印输出维度
         print(f"  - 使用分布: {self.distribution. upper()}")
         
         # 解码器骨干
         self.decoder_backbone = nn.Sequential(
-            nn. Linear(latent_dim, hidden_dim),
+            nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
-            nn. Dropout(dropout)
+            nn.Dropout(dropout)
         )
         
-        # 🔥 对于 Gaussian 损失，直接输出重构值
-        if self.distribution == 'gaussian':
-            self.output_layer = nn.Linear(hidden_dim // 2, n_output)
+        # 🔥 均值解码器：输出 n_output 维
+        self.mean_decoder = nn.Sequential(
+            nn.Linear(hidden_dim // 2, n_output),
+            nn.Softmax(dim=-1)
+        )
         
-        # 保留 NB 支持
-        elif self.distribution in ['nb', 'zinb']:
-            self.mean_decoder = nn.Sequential(
-                nn.Linear(hidden_dim // 2, n_output),
-                nn. Softmax(dim=-1)
-            )
+        # Dispersion 参数（NB/ZINB）
+        if self.distribution in ['nb', 'zinb']: 
+            # 🔥 n_output 个基因的 dispersion
             self.px_r = nn.Parameter(torch.ones(n_output) * 4.0)
+            print(f"  初始化 dispersion (θ): {torch.exp(self.px_r).mean().item():.2f}")
+        
+        # Dropout 参数（ZINB）
+        if self. distribution == 'zinb': 
+            self.dropout_decoder = nn.Sequential(
+                nn.Linear(hidden_dim // 2, n_output)
+            )
+        
+        # Variance 参数（Gaussian）
+        if self.distribution == 'gaussian': 
+            self.logvar_decoder = nn.Sequential(
+                nn.Linear(hidden_dim // 2, n_output)
+            )
     
     def forward(self, z: torch.Tensor, library_size: torch.Tensor):
         """
         解码 latent 表示
         
-        Args: 
+        Args:
             z: [N, latent_dim]
-            library_size: [N, 1]（对 PCA 重构无用，保留接口兼容性）
+            library_size: [N, 1]
         
-        Returns:  
-            dict: 分布参数
+        Returns: 
+            dict:  分布参数，输出维度为 [N, n_output]
         """
         h = self.decoder_backbone(z)
         
-        if self. distribution == 'gaussian':
-            # 🔥 直接输出重构的 PCA
-            px_rate = self.output_layer(h)  # [N, n_output]
-            
-            outputs = {
-                'px_rate': px_rate,
-                'px_scale': px_rate  # 保持接口一致
-            }
+        # 均值（library-size 归一化）
+        px_scale = self.mean_decoder(h)  # [N, n_output]
+        px_rate = library_size * px_scale
         
-        elif self.distribution in ['nb', 'zinb']: 
-            # NB 分支（保留）
-            px_scale = self.mean_decoder(h)
-            px_rate = library_size * px_scale
+        outputs = {
+            'px_rate': px_rate,
+            'px_scale': px_scale
+        }
+        
+        # NB/ZINB:  dispersion
+        if self.distribution in ['nb', 'zinb']:
             px_r = torch.exp(self.px_r)
-            
-            outputs = {
-                'px_rate': px_rate,
-                'px_scale': px_scale,
-                'px_r':  px_r
-            }
+            outputs['px_r'] = px_r
+        
+        # ZINB: dropout logits
+        if self.distribution == 'zinb':
+            outputs['px_dropout'] = self.dropout_decoder(h)
+        
+        # Gaussian: variance
+        if self. distribution == 'gaussian':
+            outputs['logvar'] = self. logvar_decoder(h)
+            outputs['var'] = torch.exp(outputs['logvar']. clamp(min=-10, max=10))
         
         return outputs
 
@@ -348,27 +363,30 @@ class ContrastiveHead(nn.Module):
 
 class SpatialDomainModel(BaseModuleClass):
     """
-    空间域识别模型 - PCA 输入输出版本
+    空间域识别模型 - 支持 Margin-based 对比学习
     """
     
     def __init__(
         self,
-        n_input: int,   # PCA 维度（如 50）
-        n_output: int,  # 🔥 输出维度（与 n_input 相同）
+        n_input: int,
+        n_output: int,
         hidden_dim: int = 256,
         latent_dim: int = 30,
         gnn_type: str = 'gine',
         n_heads: int = 4,
         dropout: float = 0.1,
         fusion_type: str = 'independent',
-        reconstruction_loss: str = 'gaussian',  # 🔥 默认改为 gaussian
+        reconstruction_loss: str = 'nb',
         # Loss weights
-        contrast_weight: float = 0.1,
-        local_contrast_weight: float = 1.0,
+        contrast_weight: float = 20.0,
+        local_contrast_weight: float = 2.0,
         global_contrast_weight: float = 0.5,
         # Contrastive parameters
-        temperature: float = 0.1,
-        contrast_sample_rate: float = 0.1,
+        temperature: float = 0.1,  # 🔥 改回小温度
+        contrast_sample_rate: float = 0.5,
+        # 🔥 新增：Margin 参数
+        local_margin: float = 0.5,  # 局部正样本的 margin
+        use_margin_loss: bool = True,  # 是否使用 margin loss
         **kwargs
     ):
         super().__init__()
@@ -376,21 +394,28 @@ class SpatialDomainModel(BaseModuleClass):
         self.n_input = n_input
         self.n_output = n_output
         self.latent_dim = latent_dim
-        self.reconstruction_loss = reconstruction_loss. lower()
+        self.reconstruction_loss = reconstruction_loss.lower()
         self.contrast_weight = contrast_weight
         self.local_contrast_weight = local_contrast_weight
         self.global_contrast_weight = global_contrast_weight
         self. temperature = temperature
         self.contrast_sample_rate = contrast_sample_rate
         
-        print(f"\n🎯 模型配置:")
-        print(f"  - 输入维度: {n_input} (PCA)")
-        print(f"  - 输出维度: {n_output} (PCA)")
-        print(f"  - Latent 维度: {latent_dim}")
-        print(f"  - 重构损失: {self.reconstruction_loss. upper()}")
-        print(f"  - Temperature: {temperature}")
+        # 🔥 Margin 参数
+        self. local_margin = local_margin
+        self.use_margin_loss = use_margin_loss
         
-        # Encoder
+        print(f"\n🎯 模型配置:")
+        print(f"  - 输入维度: {n_input}")
+        print(f"  - 输出维度: {n_output}")
+        print(f"  - Latent 维度: {latent_dim}")
+        print(f"  - 重构损失: {self.reconstruction_loss.upper()}")
+        print(f"  - Temperature: {temperature}")
+        print(f"  - 🔥 Margin Loss: {use_margin_loss}")
+        if use_margin_loss:
+            print(f"  - 🔥 Local Margin: {local_margin}")
+        
+        # 🔥 Encoder：输入 n_input 维
         self.encoder = DualGINEncoder(
             n_input=n_input,
             hidden_dim=hidden_dim,
@@ -401,7 +426,7 @@ class SpatialDomainModel(BaseModuleClass):
             fusion_type=fusion_type
         )
         
-        # Decoder
+        # 🔥 Decoder：输出 n_output 维
         self.decoder = UniversalDecoder(
             latent_dim=latent_dim,
             n_output=n_output,
@@ -411,14 +436,15 @@ class SpatialDomainModel(BaseModuleClass):
         )
         
         # Contrastive Head
-        self.  contrast_head = ContrastiveHead(latent_dim, projection_dim=128)
+        self. contrast_head = ContrastiveHead(latent_dim, projection_dim=128)
         
         # Buffers
         self.register_buffer("_spatial_edge_index", torch.empty((2, 0), dtype=torch.long))
         self.register_buffer("_spatial_edge_weight", torch.empty(0, dtype=torch.float32))
         self.register_buffer("_expr_edge_index", torch.empty((2, 0), dtype=torch.long))
-        self.register_buffer("_expr_edge_weight", torch.empty(0, dtype=torch.float32))
-        self.register_buffer("_X_pca", torch.empty((0, n_input), dtype=torch.float32))
+        self.register_buffer("_expr_edge_weight", torch. empty(0, dtype=torch. float32))
+        self.register_buffer("_X_pca", torch.empty((0, n_input), dtype=torch.float32))  # 🔥 PCA 数据
+        self.register_buffer("_X_raw", torch.empty((0, n_output), dtype=torch.float32))  # 🔥 原始数据
     
     def attach_dual_graphs(self, spatial_edge_index, spatial_edge_weight, expr_edge_index, expr_edge_weight):
         self. register_buffer("_spatial_edge_index", spatial_edge_index)
@@ -427,14 +453,16 @@ class SpatialDomainModel(BaseModuleClass):
         self.register_buffer("_expr_edge_weight", expr_edge_weight)
         return self
     
-    def attach_full_X(self, X_pca):
+    def attach_full_X(self, X_pca, X_raw):
         """
-        🔥 修改：只需要 PCA 数据
+        🔥 修改：分别保存 PCA 数据和原始数据
         
         Args:
-            X_pca:  PCA 数据 [N, n_input]
+            X_pca: PCA 降维后的数据 [N, n_input]
+            X_raw: 原始计数数据 [N, n_output]
         """
         self.register_buffer("_X_pca", X_pca)
+        self.register_buffer("_X_raw", X_raw)
         return self
     
     def forward_all(self):
@@ -442,10 +470,11 @@ class SpatialDomainModel(BaseModuleClass):
         if self._X_pca.numel() == 0:
             raise RuntimeError("需要先调用 attach_full_X")
         
+        # 🔥 编码器使用 PCA 数据
         X_pca = self._X_pca
         
-        # 🔥 library size 设为 1（不需要了，因为输出是 PCA）
-        library_size = torch.ones((X_pca.shape[0], 1), device=X_pca.device)
+        # 🔥 library size 从原始数据计算
+        library_size = self._X_raw.sum(dim=1, keepdim=True)
         
         # 编码
         z, gate_info = self.encoder(
@@ -456,32 +485,44 @@ class SpatialDomainModel(BaseModuleClass):
             self._expr_edge_weight
         )
         
-        # 解码
+        # 解码到原始空间
         decoder_outputs = self.decoder(z, library_size)
         
         return z, decoder_outputs, gate_info
     
-    def compute_reconstruction_loss(self, decoder_outputs:  dict, x_target: torch.  Tensor):
+    def compute_reconstruction_loss(self, decoder_outputs:  dict, x_raw: torch.Tensor):
         """
         计算重构损失
         
         Args:
-            decoder_outputs: 解码器输出
-            x_target: 目标数据（PCA）
+            decoder_outputs: 解码器输出 [N, n_output]
+            x_raw: 原始计数数据 [N, n_output]
         """
-        if self.reconstruction_loss == 'gaussian':
-            # 🔥 MSE 损失（最简单有效）
-            px_rate = decoder_outputs['px_rate']  # 实际上就是重构的 PCA
-            recon_loss = F.mse_loss(px_rate, x_target, reduction='none').sum(dim=-1)
+        px_rate = decoder_outputs['px_rate']
+        eps = 1e-8
+        px_rate = torch.clamp(px_rate, min=eps)
+        
+        if self.reconstruction_loss == 'zinb':
+            px_r = decoder_outputs['px_r']
+            px_dropout = decoder_outputs['px_dropout']
+            dist = ZeroInflatedNegativeBinomial(mu=px_rate, theta=px_r, zi_logits=px_dropout)
+            recon_loss = -dist.log_prob(x_raw).sum(dim=-1)
         
         elif self.reconstruction_loss == 'nb':
-            # 保留 NB 支持（如果你还想用）
-            px_rate = decoder_outputs['px_rate']
             px_r = decoder_outputs['px_r']
-            eps = 1e-8
-            px_rate = torch.clamp(px_rate, min=eps)
             dist = NegativeBinomial(mu=px_rate, theta=px_r)
-            recon_loss = -dist.log_prob(x_target).sum(dim=-1)
+            recon_loss = -dist.log_prob(x_raw).sum(dim=-1)
+        
+        elif self.reconstruction_loss == 'poisson':
+            dist = Poisson(rate=px_rate)
+            recon_loss = -dist.log_prob(x_raw).sum(dim=-1)
+        
+        elif self.reconstruction_loss == 'gaussian':
+            var = decoder_outputs['var']
+            recon_loss = 0.5 * (
+                torch.log(2 * torch.pi * var + eps) +
+                (x_raw - px_rate) ** 2 / (var + eps)
+            ).sum(dim=-1)
         
         else:
             raise ValueError(f"不支持的重构损失:  {self.reconstruction_loss}")
@@ -489,11 +530,14 @@ class SpatialDomainModel(BaseModuleClass):
         return recon_loss
     
     def contrastive_loss_fast(self, z:  torch.Tensor, contrast_samples: dict):
-        """加速版对比学习 - 修复数值稳定性"""
+        """
+        🔥 改进版：支持 Margin-based Loss
+        """
         device = z.device
         n_spots = z.size(0)
         
-        n_sample = max(int(n_spots * self.contrast_sample_rate), 100)
+        # n_sample = max(int(n_spots * self.contrast_sample_rate), 100)
+        n_sample = int(n_spots * self.contrast_sample_rate)
         sampled_indices = torch.randperm(n_spots, device=device)[:n_sample].cpu().numpy()
         
         z_proj = self.contrast_head(z)
@@ -506,28 +550,33 @@ class SpatialDomainModel(BaseModuleClass):
         for i in sampled_indices:
             anchor = z_proj[i: i+1]
             
-            # 局部对比
+            # ===== 局部对比（Spatial-domain friendly margin loss）=====
             local_pos_idx = contrast_samples['local_pos'][i]
             local_neg_idx = contrast_samples['local_neg'][i]
-            
+
             if len(local_pos_idx) > 0:
-                local_pos = z_proj[local_pos_idx]
-                
+                local_pos = z_proj[local_pos_idx]      # [n_pos, d]
+                pos_sim = torch.mm(anchor, local_pos.t())  # [1, n_pos]
+
+                # 1️⃣ 正样本：保证足够相似
+                pos_loss = F.softplus(self.local_margin - pos_sim).mean()
+
                 if len(local_neg_idx) > 0:
-                    local_neg = z_proj[local_neg_idx]
-                    pos_sim = torch.mm(anchor, local_pos. t()) / self.temperature
-                    neg_sim = torch.mm(anchor, local_neg.t()) / self.temperature
-                    logits = torch.cat([pos_sim. mean(dim=1, keepdim=True), neg_sim], dim=1)
-                    loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=device))
+                    local_neg = z_proj[local_neg_idx]  # [n_neg, d]
+                    neg_sim = torch.mm(anchor, local_neg.t())  # [1, n_neg]
+
+                    # 2️⃣ 负样本：只惩罚“太近的”
+                    neg_loss = F.softplus(neg_sim - self.local_margin).mean()
+
+                    loss = pos_loss + neg_loss
                 else:
-                    # 🔥 只有正样本：使用 softplus（数值稳定）
-                    pos_sim = torch.mm(anchor, local_pos.t()) / self.temperature
-                    loss = torch.mean(F.softplus(-pos_sim))
-                
+                    loss = pos_loss
+
                 local_loss += loss
                 n_valid_local += 1
+
             
-            # 全局对比
+            # ===== 全局对比（保持不变）=====
             global_pos_idx = contrast_samples['global_pos'][i]
             global_neg_idx = contrast_samples['global_neg'][i]
             
@@ -543,6 +592,7 @@ class SpatialDomainModel(BaseModuleClass):
                 global_loss += loss
                 n_valid_global += 1
         
+        # 平均损失
         if n_valid_local > 0:
             local_loss = local_loss / n_valid_local
         else:
@@ -550,8 +600,8 @@ class SpatialDomainModel(BaseModuleClass):
         
         if n_valid_global > 0:
             global_loss = global_loss / n_valid_global
-        else: 
-            global_loss = torch. tensor(0.0, device=device, dtype=torch.float32)
+        else:
+            global_loss = torch.tensor(0.0, device=device, dtype=torch. float32)
         
         total_contrast_loss = (
             self.local_contrast_weight * local_loss +
