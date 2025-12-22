@@ -1,0 +1,7 @@
+results/*/best_model.pt
+results/*/adata_with_domains.h5ad
+# 忽略结果目录中的大文件
+results/*/*.pt
+results/*/*.h5ad
+__pycache__/
+*.pyc

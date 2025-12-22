@@ -215,54 +215,6 @@ def main():
     log(f"预处理完毕，交集基因数={len(common_genes)}")
     # ---------- 预处理 end -------------
 
-    #  # 🔥 关键修复：确保是独立副本（不是 view）
-    # sc_adata = sc_adata[:, common_genes].copy()
-    # st_adata = st_adata[:, common_genes].copy()
-    # log(f"✅ 已转换为独立副本（避免 view 问题）")
-    # # 验证基因数
-    # log(f"🔬 预处理后基因数检查：")
-    # log(f"  sc_adata.X.shape: {sc_adata.X.shape}")
-    # log(f"  st_adata.X.shape: {st_adata.X.shape}")
-    # 🔥 确保 layers['counts'] 与 X 一致（交集基因）
-    # from scipy.sparse import issparse
-    # if issparse(st_adata.X):
-    #     st_adata.layers['counts'] = st_adata.X.copy()
-    # else:
-    #     st_adata.layers['counts'] = st_adata.X.copy()
-    # if issparse(sc_adata.X):
-    #     sc_adata.layers['counts'] = sc_adata.X.copy()
-    # else:
-    #     sc_adata.layers['counts'] = sc_adata.X.copy()
-    # log(f"✅ layers['counts'] 已更新：")
-    # log(f"  sc_adata.layers['counts'].shape: {sc_adata.layers['counts'].shape}")
-    # log(f"  st_adata.layers['counts'].shape: {st_adata.layers['counts'].shape}")
-    # ✅ 正确做法：检查 counts 是否存在
-    # preprocess_sc_st 内部已经把 raw counts 存到了 layers['counts']
-    # 切片操作 ([:, common_genes]) 会自动保留 layers 的对应切片
-    # if 'counts' not in st_adata.layers:
-    #     log("⚠️ 警告: preprocess_sc_st 未保留 counts，尝试恢复...")
-    #     if st_adata.raw is not None:
-    #          st_adata.layers['counts'] = st_adata.raw[:, common_genes].X.copy()
-    #     else:
-    #          raise ValueError("无法找到 Raw Counts！预处理函数可能丢失了数据。")
-
-    # # 2. 创建归一化+log1p 的 layer (用于 encoder)
-    # from scipy.sparse import issparse
-    # X_raw = st_adata.layers['counts']
-    # if issparse(X_raw):
-    #     X_raw = X_raw.toarray()
-    # X_raw = np.asarray(X_raw, dtype=np.float32)
-
-    # # Library size normalization
-    # library_size = X_raw.sum(axis=1, keepdims=True)
-    # X_normalized = X_raw / (library_size + 1e-6) * 10000
-
-    # # Log1p
-    # X_log = np.log1p(X_normalized)
-
-    # # 保存为新 layer
-    # st_adata.layers['normalized_log'] = X_log
-    # log(f"✅ 已创建 'normalized_log' layer（预处理）")
     from scipy.sparse import issparse
     
     # 1. 确保 layers['counts'] 存在 (作为 raw 的永久备份)

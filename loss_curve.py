@@ -5,14 +5,15 @@ import matplotlib.pyplot as plt
 
 # 以脚本所在目录为基准
 BASE = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(BASE, 'results', 'log_dual_graph_PDAC_pseudo.txt')
+log_path = os.path.join(BASE, 'results', 'log_dual_graph_PDAC.txt')
 
 with open(log_path, 'r', encoding='utf-8') as f:
     txt = f.read()
 
 # ---- 抽数 ----
 cond_pattern = re.compile(r'\[CondSCVI\] Epoch (\d+)/\d+ loss=([\d\.]+)')
-dest_pattern = re.compile(r'\[DestVI\] Epoch (\d+)/\d+ avg_loss=([\d\.]+)')
+dest_pattern = re.compile(r'\[DestVI\] Epoch (\d+)/\d+.*?reconstruction_loss=([\d\.]+)')
+# dest_pattern = re.compile(r'\[DestVI\] Epoch \d+/\d+.*?reconst=([\d\.]+)')
 cond = [(int(e), float(l)) for e, l in cond_pattern.findall(txt)]
 dest = [(int(e), float(l)) for e, l in dest_pattern.findall(txt)]
 

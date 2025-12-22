@@ -16,34 +16,34 @@ Ground Truth 分布:
   WM: 513
 
 预测聚类分布:
-  Cluster 0: 343
-  Cluster 1: 530
-  Cluster 2: 799
-  Cluster 3: 716
-  Cluster 4: 473
-  Cluster 5: 412
-  Cluster 6: 338
+  Cluster 0: 316
+  Cluster 1: 1111
+  Cluster 2: 504
+  Cluster 3: 641
+  Cluster 4: 245
+  Cluster 5: 415
+  Cluster 6: 379
 
 聚类评估指标:
-  ARI (Adjusted Rand Index):           0.3973
-  NMI (Normalized Mutual Info):        0.5658
-  AMI (Adjusted Mutual Info):          0.5646
-  FMI (Fowlkes-Mallows Index):         0.4999
-  Homogeneity:                         0.5787
-  Completeness:                          0.5534
-  V-measure:                           0.5658
+  ARI (Adjusted Rand Index):           0.2277
+  NMI (Normalized Mutual Info):        0.4040
+  AMI (Adjusted Mutual Info):          0.4024
+  FMI (Fowlkes-Mallows Index):         0.3677
+  Homogeneity:                         0.4054
+  Completeness:                          0.4026
+  V-measure:                           0.4040
 
 
 交叉表:
 True       Layer1  Layer2  Layer3  Layer4  Layer5  Layer6   WM
 Predicted                                                     
-0               2       0       0       0       0     162  179
-1               4      10      97      64     257      98    0
-2             267     240     292       0       0       0    0
-3               0       3     596     107      10       0    0
-4               0       0       4      47     354      68    0
-5               0       0       0       0      52     359    1
-6               0       0       0       0       0       5  333
+0               2       1       0       0       1     189  123
+1              66      76     349      92     286     242    0
+2               1     137     356       6       0       4    0
+3               0       1      72      75     355     138    0
+4               0       2     183      42      15       3    0
+5               0       0       0       0       0      26  389
+6             204      36      29       3      16      90    1
 
 
 指标说明:
