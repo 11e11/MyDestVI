@@ -8,6 +8,9 @@ from scvi.distributions import NegativeBinomial, ZeroInflatedNegativeBinomial
 from torch.distributions import Poisson, Normal
 from scvi import REGISTRY_KEYS
 
+# 🔥 导入GIB模块
+from .consistency_gib import ConsistencyMaskGenerator
+
 
 class GatedFusion(nn.Module):
     """门控融合模块（保持不变）"""
@@ -21,9 +24,9 @@ class GatedFusion(nn.Module):
                 nn.Linear(hidden_dim * 2, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.ReLU(),
-                nn. Dropout(0.1),
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, hidden_dim),
-                nn. Sigmoid()
+                nn.Sigmoid()
             )
         
         elif fusion_type == 'independent':
@@ -46,8 +49,8 @@ class GatedFusion(nn.Module):
             self.gate = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                nn. Tanh(),
-                nn. Dropout(0.1),
+                nn.Tanh(),
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, hidden_dim)
             )
             self.residual_weight = nn.Parameter(torch.ones(1) * 0.5)
@@ -95,32 +98,48 @@ class GatedFusion(nn.Module):
 
 class DualGINEncoder(nn.Module):
     """
-    双图编码器 - 门控融合版本
-    🔥 修改：支持不同的输入和输出维度
+    双图编码器 - 集成GIB
+    🔥 修改：在GNN前应用共享mask
     """
     
     def __init__(
         self,
-        n_input: int,  # 🔥 新增：输入维度（PCA 维度，如 50）
+        n_input: int,
         hidden_dim: int = 256,
         latent_dim: int = 64,
         gnn_type: str = 'gine',
         n_heads: int = 4,
         dropout: float = 0.1,
-        fusion_type: str = 'independent'
+        fusion_type: str = 'independent',
+        use_gib: bool = False,  # 🔥 新增
+        gib_hidden_dim: int = 128,  # 🔥 新增
+        gib_temperature: float = 1.0,  # 🔥 新增
+        gib_init_strategy: str = 'cold'  # 🔥 新增
     ):
         super().__init__()
         self.n_input = n_input
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
-        self.gnn_type = gnn_type. lower()
+        self.gnn_type = gnn_type.lower()
+        self.use_gib = use_gib
         
         print(f"🏗️ 编码器配置:")
-        print(f"  - 输入维度: {n_input}")  # 🔥 打印输入维度
-        print(f"  - GNN类型: {gnn_type. upper()}")
+        print(f"  - 输入维度:  {n_input}")
+        print(f"  - GNN类型: {gnn_type.upper()}")
         print(f"  - 融合方式: 门控融合 ({fusion_type})")
+        print(f"  - 🔥 使用GIB: {use_gib}")
         
-        # 🔥 输入投影：从 n_input 维到 hidden_dim
+        # 🔥 GIB模块
+        if self.use_gib:
+            self.gib_module = ConsistencyMaskGenerator(
+                n_input=n_input,
+                hidden_dim=gib_hidden_dim,
+                dropout=dropout,
+                init_strategy=gib_init_strategy,
+                temperature=gib_temperature
+            )
+        
+        # 输入投影
         self.input_proj = nn.Sequential(
             nn.Linear(n_input, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -134,7 +153,7 @@ class DualGINEncoder(nn.Module):
         
         # 表达图 GNN（2层）
         self.expr_conv1, self.expr_ln1 = self._make_gnn_layer(hidden_dim, hidden_dim, n_heads)
-        self.expr_conv2, self. expr_ln2 = self._make_gnn_layer(hidden_dim, hidden_dim, n_heads)
+        self.expr_conv2, self.expr_ln2 = self._make_gnn_layer(hidden_dim, hidden_dim, n_heads)
         
         # 门控融合模块
         self.gated_fusion = GatedFusion(hidden_dim, fusion_type=fusion_type)
@@ -153,10 +172,10 @@ class DualGINEncoder(nn.Module):
         if self.gnn_type == 'gine':
             mlp = nn.Sequential(
                 nn.Linear(in_dim, out_dim),
-                nn. LayerNorm(out_dim),
+                nn.LayerNorm(out_dim),
                 nn.ReLU(),
                 nn.Dropout(0.1),
-                nn. Linear(out_dim, out_dim)
+                nn.Linear(out_dim, out_dim)
             )
             conv = GINEConv(mlp, train_eps=True, edge_dim=1)
         
@@ -182,9 +201,9 @@ class DualGINEncoder(nn.Module):
     def _apply_gnn(self, conv, ln, h, edge_index, edge_weight):
         """应用 GNN 层"""
         if self.gnn_type == 'gine':
-            h_new = conv(h, edge_index, edge_attr=edge_weight. unsqueeze(-1))
+            h_new = conv(h, edge_index, edge_attr=edge_weight.unsqueeze(-1))
         elif self.gnn_type == 'gat':
-            h_new = conv(h, edge_index, edge_attr=edge_weight. unsqueeze(-1))
+            h_new = conv(h, edge_index, edge_attr=edge_weight.unsqueeze(-1))
         elif self.gnn_type == 'gcn': 
             h_new = conv(h, edge_index, edge_weight=edge_weight)
         
@@ -193,24 +212,47 @@ class DualGINEncoder(nn.Module):
     
     def forward(
         self,
-        x: torch.Tensor,  # 🔥 现在是 [N, n_input] 维
+        x: torch.Tensor,
         spatial_edge_index: torch.Tensor,
         spatial_edge_weight: torch.Tensor,
         expr_edge_index: torch.Tensor,
         expr_edge_weight: torch.Tensor
     ):
         """
-        Args:
-            x: [N, n_input]  # 🔥 PCA 降维后的数据
-        
-        Returns:
-            z: [N, latent_dim]
-            gate_info: dict
+        🔥 修改：加入GIB mask生成和应用
         """
-        # 输入投影
+        gib_info = {}
+        
+        # 🔥 1.生成共享mask (如果启用GIB)
+        if self.use_gib:
+            # 为空间图生成mask
+            spatial_mask = self.gib_module(x, spatial_edge_index)  # [E_spatial,]
+            # 为表达图生成mask
+            expr_mask = self.gib_module(x, expr_edge_index)  # [E_expr,]
+            
+            # 应用mask (逐元素乘法)
+            spatial_edge_weight = spatial_edge_weight * spatial_mask
+            expr_edge_weight = expr_edge_weight * expr_mask
+            
+            # 记录统计信息
+            gib_info = {
+                'spatial_mask_mean': spatial_mask.mean().item(),
+                'spatial_mask_std': spatial_mask.std().item(),
+                'expr_mask_mean': expr_mask.mean().item(),
+                'expr_mask_std': expr_mask.std().item(),
+                'spatial_mask_sparsity':  (spatial_mask < 0.1).float().mean().item(),
+                'expr_mask_sparsity': (expr_mask < 0.1).float().mean().item(),
+                # 有效边数统计
+                'spatial_active_edges': (spatial_mask > 0.5).sum().item(),
+                'spatial_total_edges': spatial_mask.numel(),
+                'expr_active_edges': (expr_mask > 0.5).sum().item(),
+                'expr_total_edges': expr_mask.numel()
+            }
+        
+        # 2.输入投影
         h = self.input_proj(x)
         
-        # 空间路径（2层 + 残差）
+        # 3.空间路径 (使用修正后的边权重)
         h_spatial = h
         h_spatial_new = self._apply_gnn(
             self.spatial_conv1, self.spatial_ln1,
@@ -219,12 +261,12 @@ class DualGINEncoder(nn.Module):
         h_spatial = F.relu(h_spatial_new) + h_spatial
         
         h_spatial_new = self._apply_gnn(
-            self. spatial_conv2, self.spatial_ln2,
+            self.spatial_conv2, self.spatial_ln2,
             h_spatial, spatial_edge_index, spatial_edge_weight
         )
-        h_spatial = F. relu(h_spatial_new) + h_spatial
+        h_spatial = F.relu(h_spatial_new) + h_spatial
         
-        # 表达路径（2层 + 残差）
+        # 4.表达路径 (使用修正后的边权重)
         h_expr = h
         h_expr_new = self._apply_gnn(
             self.expr_conv1, self.expr_ln1,
@@ -238,11 +280,14 @@ class DualGINEncoder(nn.Module):
         )
         h_expr = F.relu(h_expr_new) + h_expr
         
-        # 门控融合
+        # 5.门控融合
         h_fused, gate_info = self.gated_fusion(h_spatial, h_expr)
         
-        # 投影到 latent
+        # 6.投影到 latent
         z = self.to_latent(h_fused)
+        
+        # 合并信息
+        gate_info.update(gib_info)
         
         return z, gate_info
 
@@ -268,7 +313,7 @@ class UniversalDecoder(nn.Module):
         
         print(f"📊 解码器配置:")
         print(f"  - 输出维度: {n_output}")  # 🔥 打印输出维度
-        print(f"  - 使用分布: {self.distribution. upper()}")
+        print(f"  - 使用分布: {self.distribution.upper()}")
         
         # 解码器骨干
         self.decoder_backbone = nn.Sequential(
@@ -295,7 +340,7 @@ class UniversalDecoder(nn.Module):
             print(f"  初始化 dispersion (θ): {torch.exp(self.px_r).mean().item():.2f}")
         
         # Dropout 参数（ZINB）
-        if self. distribution == 'zinb': 
+        if self.distribution == 'zinb': 
             self.dropout_decoder = nn.Sequential(
                 nn.Linear(hidden_dim // 2, n_output)
             )
@@ -338,9 +383,9 @@ class UniversalDecoder(nn.Module):
             outputs['px_dropout'] = self.dropout_decoder(h)
         
         # Gaussian: variance
-        if self. distribution == 'gaussian':
-            outputs['logvar'] = self. logvar_decoder(h)
-            outputs['var'] = torch.exp(outputs['logvar']. clamp(min=-10, max=10))
+        if self.distribution == 'gaussian':
+            outputs['logvar'] = self.logvar_decoder(h)
+            outputs['var'] = torch.exp(outputs['logvar'].clamp(min=-10, max=10))
         
         return outputs
 
@@ -363,7 +408,7 @@ class ContrastiveHead(nn.Module):
 
 class SpatialDomainModel(BaseModuleClass):
     """
-    空间域识别模型 - 支持 Margin-based 对比学习
+    空间域识别模型 - 集成一致性GIB
     """
     
     def __init__(
@@ -382,11 +427,20 @@ class SpatialDomainModel(BaseModuleClass):
         local_contrast_weight: float = 2.0,
         global_contrast_weight: float = 0.5,
         # Contrastive parameters
-        temperature: float = 0.1,  # 🔥 改回小温度
+        temperature: float = 0.1,
         contrast_sample_rate: float = 0.5,
-        # 🔥 新增：Margin 参数
-        local_margin: float = 0.5,  # 局部正样本的 margin
-        use_margin_loss: bool = True,  # 是否使用 margin loss
+        # Margin 参数
+        local_margin: float = 0.5,
+        use_margin_loss: bool = True,
+        # 🔥 新增:  GIB参数
+        use_gib: bool = False,
+        gib_weight: float = 0.1,
+        gib_hidden_dim: int = 128,
+        gib_temperature: float = 1.0,  # 🔥 默认改回1.0
+        gib_loss_type: str = 'l1',  # 🔥 默认L1
+        gib_sparsity_weight: float = 1.0,
+        gib_entropy_weight:  float = 0.0,
+        gib_init_strategy: str = 'cold',  # 🔥 新增
         **kwargs
     ):
         super().__init__()
@@ -398,12 +452,17 @@ class SpatialDomainModel(BaseModuleClass):
         self.contrast_weight = contrast_weight
         self.local_contrast_weight = local_contrast_weight
         self.global_contrast_weight = global_contrast_weight
-        self. temperature = temperature
+        self.temperature = temperature
         self.contrast_sample_rate = contrast_sample_rate
-        
-        # 🔥 Margin 参数
-        self. local_margin = local_margin
+        self.local_margin = local_margin
         self.use_margin_loss = use_margin_loss
+        
+        # 🔥 GIB参数
+        self.use_gib = use_gib
+        self.gib_weight = gib_weight
+        self.gib_loss_type = gib_loss_type
+        self.gib_sparsity_weight = gib_sparsity_weight
+        self.gib_entropy_weight = gib_entropy_weight
         
         print(f"\n🎯 模型配置:")
         print(f"  - 输入维度: {n_input}")
@@ -414,8 +473,17 @@ class SpatialDomainModel(BaseModuleClass):
         print(f"  - 🔥 Margin Loss: {use_margin_loss}")
         if use_margin_loss:
             print(f"  - 🔥 Local Margin: {local_margin}")
+        print(f"  - 🔥 使用GIB: {use_gib}")
+        print(f"  - 🔥 使用GIB: {use_gib}")
+        if use_gib:
+            print(f"  - 🔥 GIB权重:  {gib_weight}")
+            print(f"  - 🔥 GIB损失类型: {gib_loss_type}")
+            print(f"  - 🔥 GIB Temperature: {gib_temperature}")
+            if gib_loss_type == 'sparsity+entropy': 
+                print(f"  - 🔥 稀疏性权重: {gib_sparsity_weight}")
+                print(f"  - 🔥 熵权重: {gib_entropy_weight}")
         
-        # 🔥 Encoder：输入 n_input 维
+        # 🔥 Encoder: 集成GIB (传递新参数)
         self.encoder = DualGINEncoder(
             n_input=n_input,
             hidden_dim=hidden_dim,
@@ -423,10 +491,14 @@ class SpatialDomainModel(BaseModuleClass):
             gnn_type=gnn_type,
             n_heads=n_heads,
             dropout=dropout,
-            fusion_type=fusion_type
+            fusion_type=fusion_type,
+            use_gib=use_gib,
+            gib_hidden_dim=gib_hidden_dim,
+            gib_temperature=gib_temperature,  # 🔥 传递temperature
+            gib_init_strategy=gib_init_strategy  # 🔥 传递初始化策略
         )
         
-        # 🔥 Decoder：输出 n_output 维
+        # Decoder (保持不变)
         self.decoder = UniversalDecoder(
             latent_dim=latent_dim,
             n_output=n_output,
@@ -435,19 +507,19 @@ class SpatialDomainModel(BaseModuleClass):
             distribution=reconstruction_loss
         )
         
-        # Contrastive Head
-        self. contrast_head = ContrastiveHead(latent_dim, projection_dim=128)
+        # Contrastive Head (保持不变)
+        self.contrast_head = ContrastiveHead(latent_dim, projection_dim=128)
         
-        # Buffers
+        # Buffers (保持不变)
         self.register_buffer("_spatial_edge_index", torch.empty((2, 0), dtype=torch.long))
         self.register_buffer("_spatial_edge_weight", torch.empty(0, dtype=torch.float32))
         self.register_buffer("_expr_edge_index", torch.empty((2, 0), dtype=torch.long))
-        self.register_buffer("_expr_edge_weight", torch. empty(0, dtype=torch. float32))
-        self.register_buffer("_X_pca", torch.empty((0, n_input), dtype=torch.float32))  # 🔥 PCA 数据
-        self.register_buffer("_X_raw", torch.empty((0, n_output), dtype=torch.float32))  # 🔥 原始数据
+        self.register_buffer("_expr_edge_weight", torch.empty(0, dtype=torch.float32))
+        self.register_buffer("_X_pca", torch.empty((0, n_input), dtype=torch.float32))
+        self.register_buffer("_X_raw", torch.empty((0, n_output), dtype=torch.float32))
     
     def attach_dual_graphs(self, spatial_edge_index, spatial_edge_weight, expr_edge_index, expr_edge_weight):
-        self. register_buffer("_spatial_edge_index", spatial_edge_index)
+        self.register_buffer("_spatial_edge_index", spatial_edge_index)
         self.register_buffer("_spatial_edge_weight", spatial_edge_weight)
         self.register_buffer("_expr_edge_index", expr_edge_index)
         self.register_buffer("_expr_edge_weight", expr_edge_weight)
@@ -470,13 +542,10 @@ class SpatialDomainModel(BaseModuleClass):
         if self._X_pca.numel() == 0:
             raise RuntimeError("需要先调用 attach_full_X")
         
-        # 🔥 编码器使用 PCA 数据
         X_pca = self._X_pca
-        
-        # 🔥 library size 从原始数据计算
         library_size = self._X_raw.sum(dim=1, keepdim=True)
         
-        # 编码
+        # 编码 (🔥 内部会应用GIB mask)
         z, gate_info = self.encoder(
             X_pca,
             self._spatial_edge_index,
@@ -485,10 +554,43 @@ class SpatialDomainModel(BaseModuleClass):
             self._expr_edge_weight
         )
         
-        # 解码到原始空间
+        # 解码
         decoder_outputs = self.decoder(z, library_size)
         
         return z, decoder_outputs, gate_info
+    
+    def compute_gib_loss(self):
+        """计算GIB损失"""
+        if not self.use_gib:
+            return torch.tensor(0.0, device=self._X_pca.device), {}
+        
+        spatial_mask = self. encoder. gib_module(self._X_pca, self._spatial_edge_index)
+        expr_mask = self.encoder.gib_module(self._X_pca, self._expr_edge_index)
+        
+        spatial_gib_loss, spatial_details = self.encoder.gib_module. compute_gib_loss(
+            spatial_mask, 
+            loss_type=self.gib_loss_type,
+            sparsity_weight=self.gib_sparsity_weight,
+            entropy_weight=self.gib_entropy_weight
+        )
+        
+        expr_gib_loss, expr_details = self.encoder.gib_module. compute_gib_loss(
+            expr_mask,
+            loss_type=self. gib_loss_type,
+            sparsity_weight=self.gib_sparsity_weight,
+            entropy_weight=self.gib_entropy_weight
+        )
+        
+        gib_loss = (spatial_gib_loss + expr_gib_loss) / 2
+        
+        gib_loss_details = {
+            'spatial_l1_loss': spatial_details['l1_loss'],
+            'spatial_entropy_loss': spatial_details['entropy_loss'],
+            'expr_l1_loss':  expr_details['l1_loss'],
+            'expr_entropy_loss': expr_details['entropy_loss']
+        }
+        
+        return gib_loss, gib_loss_details
     
     def compute_reconstruction_loss(self, decoder_outputs:  dict, x_raw: torch.Tensor):
         """
@@ -601,7 +703,7 @@ class SpatialDomainModel(BaseModuleClass):
         if n_valid_global > 0:
             global_loss = global_loss / n_valid_global
         else:
-            global_loss = torch.tensor(0.0, device=device, dtype=torch. float32)
+            global_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         
         total_contrast_loss = (
             self.local_contrast_weight * local_loss +
@@ -615,4 +717,4 @@ class SpatialDomainModel(BaseModuleClass):
         """获取 latent 表示"""
         self.eval()
         z, _, _ = self.forward_all()
-        return z. cpu().numpy()
+        return z.cpu().numpy()

@@ -9,6 +9,7 @@ import time
 from src.modules.spatial_domain_model import SpatialDomainModel
 from src.utils.dual_graph_builder import build_dual_graphs
 from src.utils.Contrasive_sampler import MultiScaleContrastiveSampler
+from src.modules.consistency_gib import AdaptiveGIBScheduler
 
 import logging
 from pathlib import Path
@@ -29,34 +30,30 @@ logging.basicConfig(
 log = logging.info
 
 
-def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, epoch, device):
+def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, epoch, device, gib_scheduler=None):
     """
     全图训练一个 epoch
-    
-    Args: 
-        X_pca: PCA 降维数据 (编码器输入) [N, n_pca]
-        X_raw:  原始计数数据 (重构目标) [N, n_genes]
+    🔥 修改：记录GIB详细损失
     """
     model.train()
     
     # 前向传播
     z, decoder_outputs, gate_info = model.forward_all()
     
-    # 1.重构损失 🔥 只需要原始数据
+    # 1.重构损失
     recon_loss = model.compute_reconstruction_loss(
         decoder_outputs=decoder_outputs,
         x_raw=X_raw
     ).mean()
     
-    # 检查 NaN
     if torch.isnan(recon_loss):
         log("⚠️ 警告：重构损失为 NaN")
         return {
             'total_loss': float('inf'),
             'recon_loss': float('inf'),
             'contrast_loss': 0.0,
-            'local_contrast':  0.0,
-            'global_contrast': 0.0,
+            'gib_loss': 0.0,
+            'gib_weight': 0.0,
             **gate_info
         }
     
@@ -64,8 +61,18 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
     contrast_loss, local_loss, global_loss = model.contrastive_loss_fast(z, contrast_samples)
     contrast_loss = contrast_loss * model.contrast_weight
     
+    # 🔥 3.GIB损失（混合）
+    gib_loss = torch.tensor(0.0, device=device)
+    current_gib_weight = 0.0
+    gib_loss_details = {}
+    
+    if model.use_gib and gib_scheduler is not None: 
+        current_gib_weight = gib_scheduler.get_weight(epoch)
+        gib_loss_raw, gib_loss_details = model.compute_gib_loss()
+        gib_loss = gib_loss_raw * current_gib_weight
+    
     # 总损失
-    total_loss = recon_loss + contrast_loss
+    total_loss = recon_loss + contrast_loss + gib_loss
     
     # 反向传播
     optimizer.zero_grad()
@@ -73,14 +80,17 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     
-    # 统计
+    # 🔥 统计信息（完整版）
     metrics = {
         'total_loss': total_loss.item(),
         'recon_loss': recon_loss.item(),
         'contrast_loss': contrast_loss.item(),
-        'local_contrast': local_loss.item() if isinstance(local_loss, torch.Tensor) else local_loss,
+        'gib_loss': gib_loss.item(),
+        'gib_weight': current_gib_weight,
+        'local_contrast':  local_loss.item() if isinstance(local_loss, torch.Tensor) else local_loss,
         'global_contrast': global_loss.item() if isinstance(global_loss, torch.Tensor) else global_loss,
-        **gate_info
+        **gate_info,
+        **gib_loss_details  # 🔥 添加GIB详细损失
     }
     
     # 分布特定统计
@@ -101,7 +111,7 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
 
 def main(args):
     log("=" * 80)
-    log("🚀 空间域识别训练 - PCA输入 + NB损失")
+    log("🚀 空间域识别训练 - PCA输入 + NB损失 + 一致性GIB")
     log("=" * 80)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -215,8 +225,8 @@ def main(args):
     # 10.初始化模型
     log("\n🏗️ 初始化模型...")
     model = SpatialDomainModel(
-        n_input=args.n_pca,              # 输入:  PCA 50 维
-        n_output=adata_hvg.n_vars,       # 输出: HVG 基因数
+        n_input=args.n_pca,
+        n_output=adata_hvg.n_vars,
         hidden_dim=args.hidden_dim,
         latent_dim=args.latent_dim,
         gnn_type=args.gnn_type,
@@ -228,7 +238,13 @@ def main(args):
         local_contrast_weight=args.local_contrast_weight,
         global_contrast_weight=args.global_contrast_weight,
         temperature=args.temperature,
-        contrast_sample_rate=args.contrast_sample_rate
+        contrast_sample_rate=args.contrast_sample_rate,
+        # 🔥 GIB参数
+        use_gib=args.use_gib,
+        gib_weight=args.gib_weight,
+        gib_hidden_dim=args.gib_hidden_dim,
+        gib_temperature=args.gib_temperature,
+        gib_loss_type=args.gib_loss_type
     ).to(device)
     
     # 注册图和数据
@@ -243,7 +259,19 @@ def main(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f"  参数量: {n_params:,}")
     
-    # 11.优化器
+    # 🔥 11.初始化GIB调度器
+    gib_scheduler = None
+    if args.use_gib:
+        log("\n📅 初始化GIB调度器...")
+        gib_scheduler = AdaptiveGIBScheduler(
+            initial_weight=args.gib_initial_weight,
+            final_weight=args.gib_weight,
+            warmup_epochs=args.gib_warmup_epochs,
+            total_epochs=args.max_epochs,
+            schedule_type=args.gib_schedule_type
+        )
+    
+    # 12.优化器 (保持不变)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -256,7 +284,7 @@ def main(args):
         eta_min=args.lr * 0.01
     )
     
-    # 12.训练循环
+    # 13.训练循环
     log("\n🏋️ 开始训练...")
     log("="*80)
     
@@ -273,7 +301,8 @@ def main(args):
             contrast_samples,
             optimizer,
             epoch,
-            device
+            device,
+            gib_scheduler=gib_scheduler  # 🔥 传入调度器
         )
         
         scheduler.step()
@@ -289,11 +318,31 @@ def main(args):
             log(f"\n{'='*80}")
             log(f"Epoch {epoch+1}/{args.max_epochs} ({epoch_time:.2f}s)")
             log(f"{'='*80}")
-            log(f"  Total Loss:        {metrics['total_loss']:.4f}")
-            log(f"  Recon Loss:      {metrics['recon_loss']:.4f}")
-            log(f"  Contrast Loss:   {metrics['contrast_loss']:.4f}")
-            log(f"    - Local:         {metrics['local_contrast']:.4f}")
-            log(f"    - Global:      {metrics['global_contrast']:.4f}")
+            log(f"  Total Loss:         {metrics['total_loss']:.4f}")
+            log(f"  Recon Loss:        {metrics['recon_loss']:.4f}")
+            log(f"  Contrast Loss:     {metrics['contrast_loss']:.4f}")
+            log(f"    - Local:          {metrics['local_contrast']:.4f}")
+            log(f"    - Global:        {metrics['global_contrast']:.4f}")
+            
+            # 🔥 GIB信息（详细版）
+            if args.use_gib:
+                log(f"  GIB Loss:          {metrics['gib_loss']:.4f}")
+                log(f"  GIB Weight:         {metrics['gib_weight']:.4f}")
+                
+                # 🔥 新增：打印各项损失
+                if 'spatial_sparsity_loss' in metrics:
+                    log(f"  GIB Components:")
+                    log(f"    - Spatial Sparsity:   {metrics['spatial_sparsity_loss']:.4f}")
+                    log(f"    - Spatial Entropy:   {metrics['spatial_entropy_loss']:.4f}")
+                    log(f"    - Expr Sparsity:     {metrics['expr_sparsity_loss']:.4f}")
+                    log(f"    - Expr Entropy:      {metrics['expr_entropy_loss']:.4f}")
+                # Mask统计
+                if 'spatial_mask_mean' in metrics:
+                    log(f"  Mask Statistics:")
+                    log(f"    - Spatial Mean:   {metrics['spatial_mask_mean']:.3f} ± {metrics.get('spatial_mask_std', 0):.3f}")
+                    log(f"    - Expr Mean:      {metrics['expr_mask_mean']:.3f} ± {metrics.get('expr_mask_std', 0):.3f}")
+                    log(f"    - Spatial Sparsity: {metrics['spatial_mask_sparsity']:.2%}")
+                    log(f"    - Expr Sparsity:    {metrics['expr_mask_sparsity']:.2%}")
             
             if 'gate_spatial_mean' in metrics:
                 log(f"  Gate (Independent):")
@@ -706,6 +755,24 @@ def main(args):
 
     log("\n✨ 所有任务完成！")
 
+    if args.use_gib:
+        log("\n" + "="*80)
+        log("🔬 运行GIB诊断...")
+        log("="*80)
+        
+        from src.utils.gib_diagnostic import GIBDiagnostic
+        
+        diagnostic = GIBDiagnostic(
+            model=model,
+            adata=adata,
+            save_dir=Path(args.save_dir) / 'gib_diagnostic'
+        )
+        
+        diagnostic.run_full_diagnostic(
+            gt_column='mclust',
+            max_spots=1000  # 可以根据内存调整
+        )
+
 
 # 辅助函数（在 main 函数外部定义）
 def plot_evaluation(adata, y_true, y_pred, valid_mask, gt_column, save_dir, spatial_key='spatial'):
@@ -1001,7 +1068,7 @@ if __name__ == "__main__":
     parser.add_argument('--max_epochs', type=int, default=300)
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
-    parser.add_argument('--log_every', type=int, default=10)
+    parser.add_argument('--log_every', type=int, default=5)
     
     # 🔥 损失权重（使用 Margin Loss 后可以用小 temperature）
     parser.add_argument('--contrast_weight', type=float, default=20)
@@ -1014,8 +1081,31 @@ if __name__ == "__main__":
     # parser.add_argument('--use_margin_loss', action='store_true', default=True,
     #                    help='使用 margin-based loss（推荐）')
     # parser.add_argument('--local_margin', type=float, default=0.5,
-    #                    help='局部正样本的 margin（范围 0. 3-0.7）')
+    #                    help='局部正样本的 margin（范围 0.3-0.7）')
+    # 🔥 修改GIB参数
+    parser.add_argument('--use_gib', action='store_true', default=False,
+                        help='是否使用一致性GIB')
+    parser.add_argument('--gib_weight', type=float, default=0.1,
+                        help='GIB损失最终权重')
+    parser.add_argument('--gib_initial_weight', type=float, default=0.0,
+                        help='GIB损失初始权重')
+    parser.add_argument('--gib_warmup_epochs', type=int, default=50,
+                        help='GIB预热轮数')
+    parser.add_argument('--gib_schedule_type', type=str, default='cosine',
+                        choices=['linear', 'cosine', 'exp'])
+    parser.add_argument('--gib_hidden_dim', type=int, default=128,
+                        help='GIB隐藏层维度')
     
+    parser.add_argument('--gib_temperature', type=float, default=1.0,
+                    help='🔥 GIB Temperature (先用1.0，稳定后再减小)')
+    parser.add_argument('--gib_loss_type', type=str, default='l1+entropy',
+                        choices=['l1', 'entropy', 'l1+entropy'])
+    parser.add_argument('--gib_sparsity_weight', type=float, default=1.0)
+    parser.add_argument('--gib_entropy_weight', type=float, default=0.0)
+    parser.add_argument('--gib_init_strategy', type=str, default='cold',
+                        choices=['cold', 'warm'],
+                        help='🔥 初始化策略 (cold=随机, warm=偏高)')
+        
     # 聚类
     parser.add_argument('--n_clusters', type=str, default='7')
     parser.add_argument('--mclust_model', type=str, default='EEE')
@@ -1025,3 +1115,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     main(args)
+
