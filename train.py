@@ -28,40 +28,6 @@ logging.basicConfig(
 
 log = logging.info
 
-import os
-import random
-import numpy as np
-import torch
-
-
-def setup_seed(seed=2020):
-    # 1.Python 自身
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    
-    # 2.Numpy
-    np.random.seed(seed)
-    
-    # 3.Pytorch CPU/GPU
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed) # 如果有多张卡
-    
-    # 4.🔥 强制 CuDNN 使用确定性算法
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    # 5.🔥 (可选) PyTorch 某些算子的确定性设置
-    # torch.use_deterministic_algorithms(True) # 这行可能会报错，如果某些算子不支持的话先注释掉
-    
-    # 6.🔥 R 语言种子
-    try:
-        import rpy2.robjects as ro
-        ro.r(f'set.seed({seed})')
-    except ImportError:
-        pass
-
-    print(f"🔒 全局随机种子已固定: {seed}")
 
 def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, epoch, device):
     """
@@ -134,7 +100,6 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
     return metrics
 
 def main(args):
-    setup_seed(args.seed)
     log("=" * 80)
     log("🚀 空间域识别训练 - PCA输入 + NB损失")
     log("=" * 80)
@@ -1010,13 +975,13 @@ if __name__ == "__main__":
     parser.add_argument('--n_pca', type=int, default=50)
     
     # 图构建
-    parser.add_argument('--k_spatial', type=int, default=18) 
+    parser.add_argument('--k_spatial', type=int, default=15) 
     parser.add_argument('--k_expr', type=int, default=12)
     
     # 对比学习采样
-    parser.add_argument('--local_pos', type=int, default=5)
+    parser.add_argument('--local_pos', type=int, default=3)
     parser.add_argument('--local_neg', type=int, default=0)
-    parser.add_argument('--global_pos', type=int, default=3)
+    parser.add_argument('--global_pos', type=int, default=4)
     parser.add_argument('--global_neg1', type=int, default=5)
     parser.add_argument('--global_neg2', type=int, default=5)
     parser.add_argument('--local_sim_percentile', type=int, default=75)
@@ -1049,7 +1014,7 @@ if __name__ == "__main__":
     # parser.add_argument('--use_margin_loss', action='store_true', default=True,
     #                    help='使用 margin-based loss（推荐）')
     # parser.add_argument('--local_margin', type=float, default=0.5,
-    #                    help='局部正样本的 margin（范围 0.3-0.7）')
+    #                    help='局部正样本的 margin（范围 0. 3-0.7）')
     
     # 聚类
     parser.add_argument('--n_clusters', type=str, default='7')

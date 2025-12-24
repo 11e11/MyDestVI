@@ -247,82 +247,100 @@ class DualGINEncoder(nn.Module):
         return z, gate_info
 
 
-class SimplifiedDecoder(nn.Module):
+class UniversalDecoder(nn.Module):
     """
-    🔥 简化的解码器（1-2 层 MLP）
-    
-    目的：防止 Decoder 过强而削弱 Encoder 的表示能力
+    通用解码器 - 优化版本
+    🔥 修改：支持不同的 latent 维度和输出维度
     """
     
     def __init__(
         self,
         latent_dim: int,
-        n_output: int,
-        hidden_dim: int = 128,  # 🔥 减小隐藏层
+        n_output: int,  # 🔥 新增：输出维度（原始基因数，如 3000）
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
         distribution: str = 'nb'
     ):
         super().__init__()
         
-        self. distribution = distribution.lower()
+        self.distribution = distribution.lower()
         self.n_output = n_output
         
-        print(f"📊 简化解码器配置:")
-        print(f"  - Latent:  {latent_dim} → Hidden: {hidden_dim} → Output: {n_output}")
-        print(f"  - 分布: {self.distribution. upper()}")
+        print(f"📊 解码器配置:")
+        print(f"  - 输出维度: {n_output}")  # 🔥 打印输出维度
+        print(f"  - 使用分布: {self.distribution. upper()}")
         
-        if self.distribution in ['nb', 'zinb', 'poisson']:
-            # 🔥 1 层隐藏层 + 输出层
-            self.decoder = nn.Sequential(
-                nn. Linear(latent_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, n_output)
+        # 解码器骨干
+        self.decoder_backbone = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # 🔥 均值解码器：输出 n_output 维
+        self.mean_decoder = nn.Sequential(
+            nn.Linear(hidden_dim // 2, n_output),
+            nn.Softmax(dim=-1)
+        )
+        
+        # Dispersion 参数（NB/ZINB）
+        if self.distribution in ['nb', 'zinb']: 
+            # 🔥 n_output 个基因的 dispersion
+            self.px_r = nn.Parameter(torch.ones(n_output) * 4.0)
+            print(f"  初始化 dispersion (θ): {torch.exp(self.px_r).mean().item():.2f}")
+        
+        # Dropout 参数（ZINB）
+        if self. distribution == 'zinb': 
+            self.dropout_decoder = nn.Sequential(
+                nn.Linear(hidden_dim // 2, n_output)
             )
-            
-            # Mean decoder（使用 softmax 归一化）
-            self.output_activation = nn.Softmax(dim=-1)
-            
-            # Dispersion 参数
-            if self.distribution in ['nb', 'zinb']: 
-                self.px_r = nn.Parameter(torch.ones(n_output) * 4.0)
         
-        elif self.distribution == 'gaussian':
-            # MSE 损失（更简单）
-            self.decoder = nn.Sequential(
-                nn.Linear(latent_dim, hidden_dim),
-                nn. ReLU(),
-                nn. Linear(hidden_dim, n_output)
+        # Variance 参数（Gaussian）
+        if self.distribution == 'gaussian': 
+            self.logvar_decoder = nn.Sequential(
+                nn.Linear(hidden_dim // 2, n_output)
             )
     
-    def forward(self, z:  torch.Tensor, library_size: torch.Tensor):
+    def forward(self, z: torch.Tensor, library_size: torch.Tensor):
         """
-        解码
+        解码 latent 表示
         
         Args:
             z: [N, latent_dim]
             library_size: [N, 1]
         
         Returns: 
-            dict: 分布参数
+            dict:  分布参数，输出维度为 [N, n_output]
         """
-        h = self.decoder(z)
+        h = self.decoder_backbone(z)
         
-        if self.distribution in ['nb', 'zinb', 'poisson']:
-            px_scale = self.output_activation(h)
-            px_rate = library_size * px_scale
-            
-            outputs = {
-                'px_rate': px_rate,
-                'px_scale': px_scale
-            }
-            
-            if self.distribution in ['nb', 'zinb']: 
-                outputs['px_r'] = torch.exp(self.px_r)
+        # 均值（library-size 归一化）
+        px_scale = self.mean_decoder(h)  # [N, n_output]
+        px_rate = library_size * px_scale
         
-        elif self.distribution == 'gaussian':
-            outputs = {
-                'px_rate': h,
-                'px_scale':  h
-            }
+        outputs = {
+            'px_rate': px_rate,
+            'px_scale': px_scale
+        }
+        
+        # NB/ZINB:  dispersion
+        if self.distribution in ['nb', 'zinb']:
+            px_r = torch.exp(self.px_r)
+            outputs['px_r'] = px_r
+        
+        # ZINB: dropout logits
+        if self.distribution == 'zinb':
+            outputs['px_dropout'] = self.dropout_decoder(h)
+        
+        # Gaussian: variance
+        if self. distribution == 'gaussian':
+            outputs['logvar'] = self. logvar_decoder(h)
+            outputs['var'] = torch.exp(outputs['logvar']. clamp(min=-10, max=10))
         
         return outputs
 
@@ -409,11 +427,11 @@ class SpatialDomainModel(BaseModuleClass):
         )
         
         # 🔥 Decoder：输出 n_output 维
-        self.decoder = SimplifiedDecoder(
+        self.decoder = UniversalDecoder(
             latent_dim=latent_dim,
             n_output=n_output,
-            hidden_dim=hidden_dim // 2,
-            # dropout=dropout,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
             distribution=reconstruction_loss
         )
         
