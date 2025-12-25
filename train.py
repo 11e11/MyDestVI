@@ -9,7 +9,7 @@ import time
 from src.modules.spatial_domain_model import SpatialDomainModel
 from src.utils.dual_graph_builder import build_dual_graphs
 from src.utils.Contrasive_sampler import MultiScaleContrastiveSampler
-from src.modules.consistency_gib import AdaptiveGIBScheduler
+
 
 import logging
 from pathlib import Path
@@ -30,15 +30,14 @@ logging.basicConfig(
 log = logging.info
 
 
-def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, epoch, device, gib_scheduler=None):
+def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, epoch, device):
     """
-    全图训练一个 epoch
-    🔥 修改：记录GIB详细损失
+    🔥 三图架构 + 双层对比学习
     """
     model.train()
     
-    # 前向传播
-    z, decoder_outputs, gate_info = model.forward_all()
+    # 🔥 修改：前向传播返回4个表示
+    z_latent, z_spatial, z_augmented_spatial, z_expr, decoder_outputs, encoder_info = model.forward_all()
     
     # 1.重构损失
     recon_loss = model.compute_reconstruction_loss(
@@ -51,28 +50,36 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
         return {
             'total_loss': float('inf'),
             'recon_loss': float('inf'),
-            'contrast_loss': 0.0,
-            'gib_loss': 0.0,
-            'gib_weight': 0.0,
-            **gate_info
+            'graph_contrast_loss':  0.0,
+            'expr_contrast_loss': 0.0,
+            'latent_contrast_loss': 0.0,
+            'expr_local':  0.0,
+            'expr_global': 0.0,
+            'latent_local': 0.0,
+            'latent_global': 0.0,
+            **encoder_info
         }
     
-    # 2.对比损失
-    contrast_loss, local_loss, global_loss = model.contrastive_loss_fast(z, contrast_samples)
-    contrast_loss = contrast_loss * model.contrast_weight
+    # 🔥 2.图对比损失（空间图 vs 增强空间图）
+    graph_contrast_loss = model.compute_graph_contrast_loss(z_spatial, z_augmented_spatial)
+    graph_contrast_loss = graph_contrast_loss * model.graph_contrast_weight
     
-    # 🔥 3.GIB损失（混合）
-    gib_loss = torch.tensor(0.0, device=device)
-    current_gib_weight = 0.0
-    gib_loss_details = {}
+    # 🔥 3a.局部-全局对比损失（在表达图表示上）
+    expr_contrast_loss, expr_local_loss, expr_global_loss = \
+        model.contrastive_loss_on_representation(
+            z_expr, contrast_samples, model.contrast_head_expr, use_margin=True
+        )
+    expr_contrast_loss = expr_contrast_loss * (model.contrast_weight * 0.5)
     
-    if model.use_gib and gib_scheduler is not None: 
-        current_gib_weight = gib_scheduler.get_weight(epoch)
-        gib_loss_raw, gib_loss_details = model.compute_gib_loss()
-        gib_loss = gib_loss_raw * current_gib_weight
+    # 🔥 3b.局部-全局对比损失（在最终latent上）
+    latent_contrast_loss, latent_local_loss, latent_global_loss = \
+        model.contrastive_loss_on_representation(
+            z_latent, contrast_samples, model.contrast_head_latent, use_margin=True
+        )
+    latent_contrast_loss = latent_contrast_loss * (model.contrast_weight * 0.5)
     
-    # 总损失
-    total_loss = recon_loss + contrast_loss + gib_loss
+    # 🔥 总损失（四项）
+    total_loss = recon_loss + graph_contrast_loss + expr_contrast_loss + latent_contrast_loss
     
     # 反向传播
     optimizer.zero_grad()
@@ -80,20 +87,21 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     
-    # 🔥 统计信息（完整版）
+    # 统计
     metrics = {
         'total_loss': total_loss.item(),
         'recon_loss': recon_loss.item(),
-        'contrast_loss': contrast_loss.item(),
-        'gib_loss': gib_loss.item(),
-        'gib_weight': current_gib_weight,
-        'local_contrast':  local_loss.item() if isinstance(local_loss, torch.Tensor) else local_loss,
-        'global_contrast': global_loss.item() if isinstance(global_loss, torch.Tensor) else global_loss,
-        **gate_info,
-        **gib_loss_details  # 🔥 添加GIB详细损失
+        'graph_contrast_loss': graph_contrast_loss.item(),
+        'expr_contrast_loss': expr_contrast_loss.item(),
+        'latent_contrast_loss': latent_contrast_loss.item(),
+        'expr_local': expr_local_loss.item() if isinstance(expr_local_loss, torch.Tensor) else expr_local_loss,
+        'expr_global': expr_global_loss.item() if isinstance(expr_global_loss, torch.Tensor) else expr_global_loss,
+        'latent_local': latent_local_loss.item() if isinstance(latent_local_loss, torch.Tensor) else latent_local_loss,
+        'latent_global': latent_global_loss.item() if isinstance(latent_global_loss, torch.Tensor) else latent_global_loss,
+        **encoder_info
     }
     
-    # 分布特定统计
+    # 分布特定统计（保持原有代码）
     if model.reconstruction_loss in ['nb', 'zinb']:
         px_r = torch.exp(model.decoder.px_r)
         metrics['px_r_mean'] = px_r.mean().item()
@@ -111,7 +119,7 @@ def train_one_epoch_fullgraph(model, X_pca, X_raw, contrast_samples, optimizer, 
 
 def main(args):
     log("=" * 80)
-    log("🚀 空间域识别训练 - PCA输入 + NB损失 + 一致性GIB")
+    log("🚀 空间域识别训练 - PCA输入 + NB损失 + topk增强图对比学习")
     log("=" * 80)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -222,7 +230,7 @@ def main(args):
             raise ValueError("NB/ZINB/Poisson 损失需要整数计数数据")
         log(f"  ✅ 原始数据验证通过（整数计数）")
     
-    # 10.初始化模型
+    # 10.🔥 修改：初始化模型
     log("\n🏗️ 初始化模型...")
     model = SpatialDomainModel(
         n_input=args.n_pca,
@@ -234,42 +242,37 @@ def main(args):
         dropout=args.dropout,
         fusion_type=args.fusion_type,
         reconstruction_loss=args.reconstruction_loss,
+        # 对比学习权重
         contrast_weight=args.contrast_weight,
         local_contrast_weight=args.local_contrast_weight,
         global_contrast_weight=args.global_contrast_weight,
         temperature=args.temperature,
         contrast_sample_rate=args.contrast_sample_rate,
-        # 🔥 GIB参数
-        use_gib=args.use_gib,
-        gib_weight=args.gib_weight,
-        gib_hidden_dim=args.gib_hidden_dim,
-        gib_temperature=args.gib_temperature,
-        gib_loss_type=args.gib_loss_type
+        local_margin=args.local_margin,
+        # 🔥 图增强参数
+        use_graph_augmentation=args.use_graph_augmentation,
+        k_augment=args.k_augment,
+        augment_mode=args.augment_mode,
+        augment_method=args.augment_method,
+        augment_weight=args.augment_weight,
+        graph_contrast_weight=args.graph_contrast_weight,
+        graph_contrast_temperature=args.graph_contrast_temperature,
+        gnn_sharing_strategy=args.gnn_sharing_strategy  # 🔥 新增
     ).to(device)
     
-    # 注册图和数据
-    model.attach_full_X(X_pca=X_pca_tensor, X_raw=X_raw_tensor)
+    # 🔥 修改：注册双图（保留表达图！）
     model.attach_dual_graphs(
         graphs['spatial_edge_index'].to(device),
         graphs['spatial_edge_weight'].to(device),
-        graphs['expr_edge_index'].to(device),
-        graphs['expr_edge_weight'].to(device)
+        graphs['expr_edge_index'].to(device),  # 🔥 保留
+        graphs['expr_edge_weight'].to(device)   # 🔥 保留
     )
+    
+    model.attach_full_X(X_pca=X_pca_tensor, X_raw=X_raw_tensor)
     
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f"  参数量: {n_params:,}")
     
-    # 🔥 11.初始化GIB调度器
-    gib_scheduler = None
-    if args.use_gib:
-        log("\n📅 初始化GIB调度器...")
-        gib_scheduler = AdaptiveGIBScheduler(
-            initial_weight=args.gib_initial_weight,
-            final_weight=args.gib_weight,
-            warmup_epochs=args.gib_warmup_epochs,
-            total_epochs=args.max_epochs,
-            schedule_type=args.gib_schedule_type
-        )
     
     # 12.优化器 (保持不变)
     optimizer = torch.optim.AdamW(
@@ -301,8 +304,7 @@ def main(args):
             contrast_samples,
             optimizer,
             epoch,
-            device,
-            gib_scheduler=gib_scheduler  # 🔥 传入调度器
+            device
         )
         
         scheduler.step()
@@ -313,46 +315,39 @@ def main(args):
         metrics['time'] = epoch_time
         history.append(metrics)
         
-        # 打印日志
+        # 🔥 修改：日志打印
         if (epoch + 1) % args.log_every == 0:
             log(f"\n{'='*80}")
             log(f"Epoch {epoch+1}/{args.max_epochs} ({epoch_time:.2f}s)")
             log(f"{'='*80}")
-            log(f"  Total Loss:         {metrics['total_loss']:.4f}")
-            log(f"  Recon Loss:        {metrics['recon_loss']:.4f}")
-            log(f"  Contrast Loss:     {metrics['contrast_loss']:.4f}")
-            log(f"    - Local:          {metrics['local_contrast']:.4f}")
-            log(f"    - Global:        {metrics['global_contrast']:.4f}")
+            log(f"  Total Loss:                {metrics['total_loss']:.4f}")
+            log(f"  Recon Loss:               {metrics['recon_loss']:.4f}")
+            log(f"  🔥 Graph Contrast Loss:      {metrics['graph_contrast_loss']:.4f}")
+            log(f"  🔥 Expr Contrast Loss:     {metrics['expr_contrast_loss']:.4f}")
+            log(f"    - Local:                 {metrics['expr_local']:.4f}")
+            log(f"    - Global:              {metrics['expr_global']:.4f}")
+            log(f"  🔥 Latent Contrast Loss:   {metrics['latent_contrast_loss']:.4f}")
+            log(f"    - Local:                 {metrics['latent_local']:.4f}")
+            log(f"    - Global:              {metrics['latent_global']:.4f}")
             
-            # 🔥 GIB信息（详细版）
-            if args.use_gib:
-                log(f"  GIB Loss:          {metrics['gib_loss']:.4f}")
-                log(f"  GIB Weight:         {metrics['gib_weight']:.4f}")
-                
-                # 🔥 新增：打印各项损失
-                if 'spatial_sparsity_loss' in metrics:
-                    log(f"  GIB Components:")
-                    log(f"    - Spatial Sparsity:   {metrics['spatial_sparsity_loss']:.4f}")
-                    log(f"    - Spatial Entropy:   {metrics['spatial_entropy_loss']:.4f}")
-                    log(f"    - Expr Sparsity:     {metrics['expr_sparsity_loss']:.4f}")
-                    log(f"    - Expr Entropy:      {metrics['expr_entropy_loss']:.4f}")
-                # Mask统计
-                if 'spatial_mask_mean' in metrics:
-                    log(f"  Mask Statistics:")
-                    log(f"    - Spatial Mean:   {metrics['spatial_mask_mean']:.3f} ± {metrics.get('spatial_mask_std', 0):.3f}")
-                    log(f"    - Expr Mean:      {metrics['expr_mask_mean']:.3f} ± {metrics.get('expr_mask_std', 0):.3f}")
-                    log(f"    - Spatial Sparsity: {metrics['spatial_mask_sparsity']:.2%}")
-                    log(f"    - Expr Sparsity:    {metrics['expr_mask_sparsity']:.2%}")
+            # 图统计
+            if 'augment_num_edges' in metrics: 
+                log(f"  📊 Graph Statistics:")
+                log(f"    - Spatial Original:       {metrics['spatial_original_edges']}")
+                log(f"    - Augment Edges:        {metrics['augment_num_edges']}")
+                log(f"    - Spatial Augmented:    {metrics['spatial_augmented_edges']}")
             
+            # 门控统计（如果有）
             if 'gate_spatial_mean' in metrics:
                 log(f"  Gate (Independent):")
-                log(f"    - Spatial:      {metrics['gate_spatial_mean']:.3f}")
-                log(f"    - Expression:  {metrics['gate_expr_mean']:.3f}")
+                log(f"    - Spatial:               {metrics['gate_spatial_mean']:.3f}")
+                log(f"    - Expression:          {metrics['gate_expr_mean']:.3f}")
             
-            if 'px_r_mean' in metrics:
-                log(f"  Dispersion (θ):  {metrics['px_r_mean']:.3f} ± {metrics['px_r_std']:.3f}")
+            # Dispersion参数（保持原有）
+            if 'px_r_mean' in metrics: 
+                log(f"  Dispersion (θ):          {metrics['px_r_mean']:.3f} ± {metrics['px_r_std']:.3f}")
             
-            log(f"  LR:               {metrics['lr']:.6f}")
+            log(f"  LR:                       {metrics['lr']:.6f}")
         
         # 保存最佳模型
         if metrics['total_loss'] < best_loss:
@@ -755,25 +750,7 @@ def main(args):
 
     log("\n✨ 所有任务完成！")
 
-    if args.use_gib:
-        log("\n" + "="*80)
-        log("🔬 运行GIB诊断...")
-        log("="*80)
-        
-        from src.utils.gib_diagnostic import GIBDiagnostic
-        
-        diagnostic = GIBDiagnostic(
-            model=model,
-            adata=adata,
-            save_dir=Path(args.save_dir) / 'gib_diagnostic'
-        )
-        
-        diagnostic.run_full_diagnostic(
-            gt_column='mclust',
-            max_spots=1000  # 可以根据内存调整
-        )
-
-
+    
 # 辅助函数（在 main 函数外部定义）
 def plot_evaluation(adata, y_true, y_pred, valid_mask, gt_column, save_dir, spatial_key='spatial'):
     """生成评估可视化图"""
@@ -930,7 +907,7 @@ def plot_results(adata, history_df, args, n_domains):
         sc.pl.spatial(adata, color='mclust', ax=axes[0, 0], show=False, 
                      title=f'Spatial Domains (mclust, n={n_domains})', 
                      legend_loc='right margin', size=1.5)
-    except Exception as e: 
+    except Exception as e:  
         log(f"  ⚠️ 空间可视化失败: {e}")
         axes[0, 0].text(0.5, 0.5, 'Spatial plot not available', 
                        ha='center', va='center', transform=axes[0, 0].transAxes)
@@ -941,18 +918,30 @@ def plot_results(adata, history_df, args, n_domains):
         sc.tl.umap(adata, min_dist=0.3)
         sc.pl.umap(adata, color='mclust', ax=axes[0, 1], show=False,
                   title='UMAP (Latent Space)', legend_loc='right margin')
-    except Exception as e: 
+    except Exception as e:  
         log(f"  ⚠️ UMAP 失败: {e}")
-        axes[0, 1].text(0.5, 0.5, f'UMAP failed:  {str(e)[:50]}', 
+        axes[0, 1].text(0.5, 0.5, f'UMAP failed: {str(e)[:50]}', 
                        ha='center', va='center', transform=axes[0, 1].transAxes)
     
-    # 3.训练曲线
+    # 🔥 3.训练曲线（修改：适配新的损失结构）
     axes[1, 0].plot(history_df['epoch'], history_df['total_loss'], 
                    label='Total', linewidth=2, color='black')
     axes[1, 0].plot(history_df['epoch'], history_df['recon_loss'], 
                    label='Recon', alpha=0.7, color='blue')
-    axes[1, 0].plot(history_df['epoch'], history_df['contrast_loss'], 
-                   label='Contrast', alpha=0.7, color='red')
+    
+    # 🔥 修改：绘制新的对比学习损失
+    if 'graph_contrast_loss' in history_df.columns:
+        axes[1, 0].plot(history_df['epoch'], history_df['graph_contrast_loss'], 
+                       label='Graph Contrast', alpha=0.7, color='red')
+    
+    if 'expr_contrast_loss' in history_df.columns:
+        axes[1, 0].plot(history_df['epoch'], history_df['expr_contrast_loss'], 
+                       label='Expr Contrast', alpha=0.7, color='green')
+    
+    if 'latent_contrast_loss' in history_df.columns:
+        axes[1, 0].plot(history_df['epoch'], history_df['latent_contrast_loss'], 
+                       label='Latent Contrast', alpha=0.7, color='orange')
+    
     axes[1, 0].set_xlabel('Epoch')
     axes[1, 0].set_ylabel('Loss')
     axes[1, 0].set_title(f'Training Curves ({args.reconstruction_loss.upper()})')
@@ -960,19 +949,42 @@ def plot_results(adata, history_df, args, n_domains):
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].set_yscale('log')
     
-    # 4.门控权重
-    if 'gate_spatial_mean' in history_df.columns:
-        axes[1, 1].plot(history_df['epoch'], history_df['gate_spatial_mean'], 
-                       label='Spatial Gate', marker='o', markersize=2, linewidth=2, color='blue')
-        axes[1, 1].plot(history_df['epoch'], history_df['gate_expr_mean'], 
-                       label='Expression Gate', marker='s', markersize=2, linewidth=2, color='orange')
-        axes[1, 1].axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Balance')
-        axes[1, 1].set_ylabel('Gate Value (Sigmoid)')
-        axes[1, 1].set_title('Independent Gated Fusion')
-        axes[1, 1].set_ylim([0, 1])
+    # 🔥 4.对比学习损失细节（新增）
+    if 'graph_contrast_loss' in history_df.columns:
+        # 绘制三种对比学习损失的对比
+        axes[1, 1].plot(history_df['epoch'], history_df['graph_contrast_loss'], 
+                       label='Graph Contrast', marker='o', markersize=2, linewidth=2, color='red')
+        
+        if 'expr_contrast_loss' in history_df.columns:
+            axes[1, 1].plot(history_df['epoch'], history_df['expr_contrast_loss'], 
+                           label='Expr Contrast', marker='s', markersize=2, linewidth=2, color='green')
+        
+        if 'latent_contrast_loss' in history_df.columns:
+            axes[1, 1].plot(history_df['epoch'], history_df['latent_contrast_loss'], 
+                           label='Latent Contrast', marker='^', markersize=2, linewidth=2, color='orange')
+        
         axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Contrast Loss')
+        axes[1, 1].set_title('Contrastive Learning Losses')
         axes[1, 1].legend(loc='best')
         axes[1, 1].grid(True, alpha=0.3)
+    else:
+        # 🔥 回退：如果没有图对比损失，绘制门控权重（如果有）
+        if 'gate_spatial_mean' in history_df.columns:
+            axes[1, 1].plot(history_df['epoch'], history_df['gate_spatial_mean'], 
+                           label='Spatial Gate', marker='o', markersize=2, linewidth=2, color='blue')
+            axes[1, 1].plot(history_df['epoch'], history_df['gate_expr_mean'], 
+                           label='Expression Gate', marker='s', markersize=2, linewidth=2, color='orange')
+            axes[1, 1].axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Balance')
+            axes[1, 1].set_ylabel('Gate Value (Sigmoid)')
+            axes[1, 1].set_title('Independent Gated Fusion')
+            axes[1, 1].set_ylim([0, 1])
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].legend(loc='best')
+            axes[1, 1].grid(True, alpha=0.3)
+        else:
+            axes[1, 1].text(0.5, 0.5, 'No additional metrics', 
+                           ha='center', va='center', transform=axes[1, 1].transAxes)
     
     plt.tight_layout()
     fig_path = Path(args.save_dir) / 'results_summary.png'
@@ -980,7 +992,7 @@ def plot_results(adata, history_df, args, n_domains):
     log(f"  ✅ 保存可视化到 {fig_path}")
     plt.close()
     
-    # 聚类不确定性图
+    # 聚类不确定性图（保持不变）
     if 'mclust_uncertainty' in adata.obs.columns:
         plot_uncertainty(adata, args.save_dir, args.spatial_key)
 
@@ -1030,22 +1042,24 @@ def plot_uncertainty(adata, save_dir, spatial_key='spatial'):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='空间域识别 - PCA输入 + NB损失')
+    parser = argparse.ArgumentParser(description='空间域识别 - 三图架构 + 双层对比学习')
         
-    # 数据
+    # ========================================
+    # 数据参数（保持不变）
+    # ========================================
     parser.add_argument('--adata_path', type=str, required=True)
     parser.add_argument('--spatial_key', type=str, default='spatial')
-    parser.add_argument('--save_dir', type=str, default='./results/spatial_domain_pca')
+    parser.add_argument('--save_dir', type=str, default='./results/spatial_domain_triplegraph')
     
-    # 高变基因和 PCA
+    # 高变基因和 PCA（保持不变）
     parser.add_argument('--n_hvg', type=int, default=3000)
     parser.add_argument('--n_pca', type=int, default=50)
     
-    # 图构建
+    # 🔥 图构建参数（保持双图！）
     parser.add_argument('--k_spatial', type=int, default=15) 
-    parser.add_argument('--k_expr', type=int, default=12)
+    parser.add_argument('--k_expr', type=int, default=12)  # 🔥 保留表达图
     
-    # 对比学习采样
+    # 对比学习采样（保持不变）
     parser.add_argument('--local_pos', type=int, default=3)
     parser.add_argument('--local_neg', type=int, default=0)
     parser.add_argument('--global_pos', type=int, default=4)
@@ -1053,65 +1067,72 @@ if __name__ == "__main__":
     parser.add_argument('--global_neg2', type=int, default=5)
     parser.add_argument('--local_sim_percentile', type=int, default=75)
     
-    # 模型架构
+    # ========================================
+    # 模型架构参数
+    # ========================================
     parser.add_argument('--gnn_type', type=str, default='gine')
     parser.add_argument('--n_heads', type=int, default=4)
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--latent_dim', type=int, default=32) 
     parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--fusion_type', type=str, default='independent')
+    parser.add_argument('--fusion_type', type=str, default='independent',
+                        choices=['independent', 'simple', 'adaptive'])
+    parser.add_argument('--reconstruction_loss', type=str, default='nb',
+                        choices=['nb', 'zinb', 'poisson', 'gaussian'])
     
-    # 重构损失
-    parser.add_argument('--reconstruction_loss', type=str, default='nb')  
+    # ========================================
+    # 🔥 图增强参数（新增）
+    # ========================================
+    parser.add_argument('--use_graph_augmentation', action='store_true', default=False,
+                        help='是否使用图增强')
+    parser.add_argument('--k_augment', type=int, default=20,
+                        help='增强图的TopK值')
+    parser.add_argument('--augment_mode', type=str, default='topk',
+                        choices=['topk', 'threshold'],
+                        help='增强图生成模式')
+    parser.add_argument('--augment_method', type=str, default='add',
+                        choices=['add', 'replace'],
+                        help='增强方式：add=加法，replace=替换')
+    parser.add_argument('--augment_weight', type=float, default=0.5,
+                        help='增强图权重（加法模式时）')
+    parser.add_argument('--gnn_sharing_strategy', type=str, default='partial',
+                        choices=['none', 'full', 'partial'],
+                        help='🔥 GNN参数共享策略')
     
-    # 训练
+    # ========================================
+    # 训练参数（保持不变）
+    # ========================================
     parser.add_argument('--max_epochs', type=int, default=300)
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
-    parser.add_argument('--log_every', type=int, default=5)
+    parser.add_argument('--log_every', type=int, default=1)
     
-    # 🔥 损失权重（使用 Margin Loss 后可以用小 temperature）
-    parser.add_argument('--contrast_weight', type=float, default=20)
+    # ========================================
+    # 🔥 损失权重（修改）
+    # ========================================
+    # 对比学习权重
+    parser.add_argument('--contrast_weight', type=float, default=20.0,
+                        help='局部-全局对比学习总权重')
     parser.add_argument('--local_contrast_weight', type=float, default=2.0)
     parser.add_argument('--global_contrast_weight', type=float, default=1.0)
-    parser.add_argument('--temperature', type=float, default=0.3)  # 🔥 改回 0.3
+    parser.add_argument('--temperature', type=float, default=0.3)
     parser.add_argument('--contrast_sample_rate', type=float, default=0.5)
-
-    # 🔥 Margin 参数
-    # parser.add_argument('--use_margin_loss', action='store_true', default=True,
-    #                    help='使用 margin-based loss（推荐）')
-    # parser.add_argument('--local_margin', type=float, default=0.5,
-    #                    help='局部正样本的 margin（范围 0.3-0.7）')
-    # 🔥 修改GIB参数
-    parser.add_argument('--use_gib', action='store_true', default=False,
-                        help='是否使用一致性GIB')
-    parser.add_argument('--gib_weight', type=float, default=0.1,
-                        help='GIB损失最终权重')
-    parser.add_argument('--gib_initial_weight', type=float, default=0.0,
-                        help='GIB损失初始权重')
-    parser.add_argument('--gib_warmup_epochs', type=int, default=50,
-                        help='GIB预热轮数')
-    parser.add_argument('--gib_schedule_type', type=str, default='cosine',
-                        choices=['linear', 'cosine', 'exp'])
-    parser.add_argument('--gib_hidden_dim', type=int, default=128,
-                        help='GIB隐藏层维度')
+    parser.add_argument('--local_margin', type=float, default=0.5)
     
-    parser.add_argument('--gib_temperature', type=float, default=1.0,
-                    help='🔥 GIB Temperature (先用1.0，稳定后再减小)')
-    parser.add_argument('--gib_loss_type', type=str, default='l1+entropy',
-                        choices=['l1', 'entropy', 'l1+entropy'])
-    parser.add_argument('--gib_sparsity_weight', type=float, default=1.0)
-    parser.add_argument('--gib_entropy_weight', type=float, default=0.0)
-    parser.add_argument('--gib_init_strategy', type=str, default='cold',
-                        choices=['cold', 'warm'],
-                        help='🔥 初始化策略 (cold=随机, warm=偏高)')
-        
-    # 聚类
+    # 🔥 图对比学习权重（新增）
+    parser.add_argument('--graph_contrast_weight', type=float, default=10.0,
+                        help='🔥 图对比学习权重')
+    parser.add_argument('--graph_contrast_temperature', type=float, default=0.5,
+                        help='🔥 图对比学习温度')
+    
+    # ========================================
+    # 聚类参数（保持不变）
+    # ========================================
     parser.add_argument('--n_clusters', type=str, default='7')
     parser.add_argument('--mclust_model', type=str, default='EEE')
     parser.add_argument('--refine_boundary', action='store_true')
     parser.add_argument('--seed', type=int, default=2020)
-    
+        
     args = parser.parse_args()
     
     main(args)
