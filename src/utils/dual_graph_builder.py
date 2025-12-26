@@ -38,6 +38,41 @@ from torch_geometric.utils import to_undirected
 #     edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
     
 #     return edge_index, edge_weight
+def build_spatial_graph_only(adata, k=6, spatial_key='spatial'):
+    """
+    只构建空间KNN图
+    
+    Returns:
+        edge_index: [2, E]
+        edge_weight: [E,]
+    """
+    from sklearn.neighbors import NearestNeighbors
+    import torch
+    
+    spatial_coords = adata. obsm[spatial_key]
+    
+    # KNN
+    nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='kd_tree').fit(spatial_coords)
+    distances, indices = nbrs.kneighbors(spatial_coords)
+    
+    # 构建边
+    src = []
+    dst = []
+    weights = []
+    
+    for i in range(len(spatial_coords)):
+        for j_idx in range(1, k+1):  # 跳过自己
+            j = indices[i, j_idx]
+            d = distances[i, j_idx]
+            
+            src.append(i)
+            dst.append(j)
+            weights.append(np.exp(-d**2 / (2 * d. mean()**2)))  # Gaussian kernel
+    
+    edge_index = torch.LongTensor([src, dst])
+    edge_weight = torch.FloatTensor(weights)
+    
+    return edge_index, edge_weight
 
 def build_spatial_graph(adata, k=6, spatial_key='spatial', use_global_sigma=True):
     """
