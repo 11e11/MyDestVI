@@ -93,24 +93,29 @@ def train_one_epoch_gib(model, X_pca, X_raw, optimizer, epoch, device, warmup_ep
             'recon_loss': float('inf'),
             'contrastive_loss': 0.0,
             'prototype_loss': 0.0,
+            'gib_sparsity_loss': 0.0,  # 🔥 新增
             'in_warmup': True,
             **info
         }
     
     in_warmup = epoch < warmup_epochs
     
-    # 2.🔥 对比学习损失（warmup后启动）
+    # 🔥 2.GIB稀疏性损失（从第一个epoch就启动）
+    gib_sparsity_loss = info['_gib_sparsity_loss_tensor'] * model.gib_sparsity_weight
+    
+    # 3.对比学习损失（warmup后启动）
     if not in_warmup:
         contrastive_loss = model.compute_contrastive_loss(z_anchor, z_learner)
         contrastive_loss = contrastive_loss * model.contrastive_weight
     else:
         contrastive_loss = torch.tensor(0.0, device=device)
     
-    # 3.原型损失（warmup后）
+    # 4.原型损失（warmup后）
     if in_warmup:
         prototype_loss = torch.tensor(0.0, device=device)
         proto_loss_dict = {'proto_s2p': 0.0, 'proto_compact': 0.0, 'proto_disperse': 0.0}
-        total_loss = recon_loss
+        # 🔥 warmup期：重构 + GIB稀疏性
+        total_loss = recon_loss + gib_sparsity_loss
     
     elif epoch == warmup_epochs:
         # K-Means初始化原型
@@ -125,12 +130,14 @@ def train_one_epoch_gib(model, X_pca, X_raw, optimizer, epoch, device, warmup_ep
         
         prototype_loss = torch.tensor(0.0, device=device)
         proto_loss_dict = {'proto_s2p': 0.0, 'proto_compact': 0.0, 'proto_disperse': 0.0}
-        total_loss = recon_loss + contrastive_loss
+        # 🔥 初始化epoch：重构 + 对比 + GIB
+        total_loss = recon_loss + contrastive_loss + gib_sparsity_loss
     
     else:
         prototype_loss, proto_loss_dict, Q = model.compute_prototype_loss(z_anchor)
         prototype_loss = prototype_loss * model.prototype_weight
-        total_loss = recon_loss + contrastive_loss + prototype_loss
+        # 🔥 完整训练：重构 + 对比 + 原型 + GIB
+        total_loss = recon_loss + contrastive_loss + prototype_loss + gib_sparsity_loss
     
     # 反向传播
     optimizer.zero_grad()
@@ -144,13 +151,14 @@ def train_one_epoch_gib(model, X_pca, X_raw, optimizer, epoch, device, warmup_ep
         'recon_loss': recon_loss.item(),
         'contrastive_loss': contrastive_loss.item() if not in_warmup else 0.0,
         'prototype_loss': prototype_loss.item(),
-        'in_warmup': in_warmup,
+        'gib_sparsity_loss': gib_sparsity_loss.item(),  # 🔥 新增
+        'in_warmup':  in_warmup,
         **proto_loss_dict,
-        **info  # 包含gib_keep_rate, gib_avg_prob等
+        **{k: v for k, v in info.items() if not k.startswith('_')}  # 过滤内部tensor
     }
     
     # 🔥 添加dispersion参数统计
-    if model.reconstruction_loss in ['nb', 'zinb']:
+    if model.reconstruction_loss in ['nb', 'zinb']: 
         if hasattr(model, 'px_r'):
             px_r = torch.exp(model.px_r)
             metrics['px_r_mean'] = px_r.mean().item()
@@ -763,8 +771,12 @@ def main(args):
                 log(f"Epoch {epoch+1}/{args.max_epochs} ({epoch_time:.2f}s)")
             
             log(f"{'='*80}")
-            log(f"  Total Loss:              {metrics['total_loss']:.4f}")
+            log(f"  Total Loss:               {metrics['total_loss']:.4f}")
             log(f"  Recon Loss:              {metrics['recon_loss']:.4f}")
+            
+            # 🔥 GIB稀疏性损失
+            if 'gib_sparsity_loss' in metrics:
+                log(f"  🔥 GIB Sparsity Loss:    {metrics['gib_sparsity_loss']:.4f}")
             
             # 🔥 对比学习损失
             if not metrics.get('in_warmup', False) and 'contrastive_loss' in metrics:
@@ -775,17 +787,17 @@ def main(args):
                 log(f"  🔥 Prototype Loss:       {metrics['prototype_loss']:.4f}")
                 
                 if 'proto_s2p' in metrics and metrics['proto_s2p'] > 0:
-                    log(f"    - Spot-to-Prototype:    {metrics['proto_s2p']:.4f}")
+                    log(f"    - Spot-to-Prototype:     {metrics['proto_s2p']:.4f}")
                     log(f"    - Compactness:         {metrics['proto_compact']:.4f}")
                     log(f"    - Dispersion:          {metrics['proto_disperse']:.4f}")
             
             # 🔥 GIB统计
-            if 'gib_keep_rate' in metrics: 
+            if 'gib_keep_rate' in metrics:  
                 log(f"  GIB Keep Rate:           {metrics['gib_keep_rate']:.3f}")
                 log(f"  GIB Avg Prob:            {metrics['gib_avg_prob']:.3f}")
             
             # Dispersion参数（如果使用NB/ZINB）
-            if 'px_r_mean' in metrics: 
+            if 'px_r_mean' in metrics:  
                 log(f"  Dispersion (θ):          {metrics['px_r_mean']:.3f} ± {metrics['px_r_std']:.3f}")
             
             log(f"  Learning Rate:           {metrics['lr']:.6f}")
@@ -1148,8 +1160,7 @@ if __name__ == "__main__":
     # 图构建参数
     parser.add_argument('--k_spatial', type=int, default=6,
                         help='空间图的K邻居')
-    parser.add_argument('--k_expr', type=int, default=10,
-                        help='表达图的K邻居')
+
     
     # 模型架构参数
     parser.add_argument('--hidden_dim', type=int, default=256,
@@ -1164,15 +1175,6 @@ if __name__ == "__main__":
                         choices=['nb', 'zinb', 'poisson'],
                         help='重构损失类型')
     
-    # 🔥 图学习参数
-    parser.add_argument('--use_graph_learning', action='store_true', default=False,
-                        help='是否使用图学习')
-    parser.add_argument('--k_learned_neighbors', type=int, default=15,
-                        help='学习图的K邻居')
-    parser.add_argument('--graph_learning_hidden', type=int, default=128,
-                        help='图学习器隐藏维度')
-    parser.add_argument('--graph_sparsity_weight', type=float, default=0.01,
-                        help='图稀疏性损失权重')
     
     # 🔥 原型学习参数
     parser.add_argument('--use_prototype', action='store_true', default=False,
@@ -1192,7 +1194,7 @@ if __name__ == "__main__":
                         help='Warmup轮数')
     
     # 训练参数
-    parser.add_argument('--max_epochs', type=int, default=250,
+    parser.add_argument('--max_epochs', type=int, default=300,
                         help='最大训练轮数')
     parser.add_argument('--lr', type=float, default=5e-4,
                         help='学习率')
@@ -1209,7 +1211,8 @@ if __name__ == "__main__":
     
     # 🔥 新增GIB参数
     parser.add_argument('--gib_hidden', type=int, default=64)
-    parser.add_argument('--gib_min_keep', type=float, default=0.4)
+    parser.add_argument('--gib_min_keep', type=float, default=0.05)  # 🔥 改为0.05
+    parser.add_argument('--gib_sparsity_weight', type=float, default=0.5)  # 🔥 新增
     parser.add_argument('--gib_max_keep', type=float, default=0.8)
     
     # 🔥 对比学习参数
@@ -1217,7 +1220,7 @@ if __name__ == "__main__":
     parser.add_argument('--contrastive_weight', type=float, default=1.0)
     
     # 原型学习参数
-    parser.add_argument('--prototype_temp', type=float, default=0.1)
+    parser.add_argument('--prototype_temp', type=float, default=0.3)
     parser.add_argument('--prototype_weight', type=float, default=20.0)
 
     # 其他

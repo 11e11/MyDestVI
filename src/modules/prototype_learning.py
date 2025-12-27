@@ -12,7 +12,7 @@ class LearnablePrototypes(nn.Module):
         self,
         n_prototypes: int,
         prototype_dim: int,
-        temperature: float = 0.1,
+        temperature: float = 0.3,  # 🔥 提高温度：0.1 -> 0.3
         momentum: float = 0.99
     ):
         super().__init__()
@@ -42,7 +42,7 @@ class LearnablePrototypes(nn.Module):
         self.register_buffer('initialized', torch.tensor(False))
     
     @torch.no_grad()
-    def initialize_with_kmeans(self, z:  torch.Tensor):
+    def initialize_with_kmeans(self, z:   torch.Tensor):
         """
         🔥 使用K-Means初始化原型
         
@@ -127,7 +127,7 @@ class LearnablePrototypes(nn.Module):
         # 更新原型参数
         self.prototypes.data = F.normalize(self.prototypes_ema.data, p=2, dim=-1)
     
-    def forward(self, z: torch.Tensor, update:  bool = True):
+    def forward(self, z:  torch.Tensor, update:   bool = True):
         """前向传播"""
         Q, labels = self.compute_assignment(z)
         
@@ -140,23 +140,23 @@ class LearnablePrototypes(nn.Module):
 
 class PrototypeLoss(nn.Module):
     """
-    原型对比损失
+    原型对比损失 - 修改版
     
-    包含三个组件：
-    1.Spot-to-Prototype对比
-    2.域内紧致性
-    3.原型分散性
+    🔥 关键变化：
+    1.完全移除域内紧致性损失
+    2.改进原型分散性损失（只防止完全塌缩）
+    3.主要依靠 spot-to-prototype 对比
     """
     
-    def __init__(self, temperature: float = 0.1):
+    def __init__(self, temperature: float = 0.3):  # 🔥 提高温度
         super().__init__()
         self.temperature = temperature
     
-    def spot_to_prototype_loss(self, z: torch.Tensor, prototypes: torch.Tensor, Q: torch.Tensor):
+    def spot_to_prototype_loss(self, z:  torch.Tensor, prototypes: torch.Tensor, Q: torch.Tensor):
         """
         Spot-to-Prototype对比损失
         
-        目标：每个spot接近其分配的原型
+        目标：每个spot接近其分配的原型（但不要求紧致）
         """
         # 归一化
         z_norm = F.normalize(z, p=2, dim=-1)
@@ -171,52 +171,27 @@ class PrototypeLoss(nn.Module):
         
         return loss
     
-    def within_domain_compactness(self, z: torch.Tensor, labels: torch.Tensor):
-        """
-        域内紧致性损失
-        
-        目标：同域spot聚集
-        """
-        unique_labels = labels.unique()
-        
-        compactness = 0.0
-        count = 0
-        
-        for label in unique_labels:
-            mask = (labels == label)
-            if mask.sum() < 2:
-                continue
-            
-            z_domain = z[mask]
-            center = z_domain.mean(dim=0, keepdim=True)
-            
-            # 域内方差
-            var = ((z_domain - center) ** 2).sum(dim=-1).mean()
-            compactness += var
-            count += 1
-        
-        if count > 0:
-            compactness = compactness / count
-        
-        return compactness
-    
     def prototype_dispersion(self, prototypes: torch.Tensor):
         """
-        原型分散性损失
+        原型分散性损失 - 改进版
         
-        目标：原型之间分散（防止塌缩）
+        🔥 只防止完全塌缩，不要求均匀分散
+        
+        方法：使用方差作为度量
+        - 如果所有原型都塌缩到一个点，方差接近0
+        - 允许部分原型接近（例如Layer3和Layer4可以很接近）
         """
         prototypes_norm = F.normalize(prototypes, p=2, dim=-1)
         
-        # 原型间相似度
-        sim_matrix = torch.mm(prototypes_norm, prototypes_norm.t())
+        # 计算原型的"扩散程度"（方差）
+        # 如果所有原型塌缩，centroid周围的方差会很小
+        centroid = prototypes_norm.mean(dim=0, keepdim=True)  # [1, D]
+        variance = ((prototypes_norm - centroid) ** 2).sum(dim=-1).mean()
         
-        # 去除对角线
-        mask = torch.eye(prototypes.size(0), device=prototypes.device).bool()
-        sim_matrix = sim_matrix.masked_fill(mask, 0)
-        
-        # 惩罚高相似度
-        loss = sim_matrix.abs().mean()
+        # 惩罚低方差（即塌缩）
+        # 目标：variance应该大于某个阈值（例如0.1）
+        target_variance = 0.5  # 超参数：可以调整
+        loss = F.relu(target_variance - variance)  # 只有当variance < target时才有损失
         
         return loss
     
@@ -229,21 +204,21 @@ class PrototypeLoss(nn.Module):
             total_loss: 标量
             loss_dict: dict 各项损失详情
         """
-        # 1.Spot-to-Prototype
+        # 1.Spot-to-Prototype（主要损失）
         loss_s2p = self.spot_to_prototype_loss(z, prototypes, Q)
         
-        # 2.域内紧致性
-        loss_compact = self.within_domain_compactness(z, labels)
+        # 2.🔥 移除域内紧致性损失
+        loss_compact = torch.tensor(0.0, device=z.device)
         
-        # 3.原型分散性
+        # 3.原型分散性（只防止塌缩）
         loss_disperse = self.prototype_dispersion(prototypes)
         
-        # 总损失
-        total_loss = loss_s2p + 0.5 * loss_compact + 0.1 * loss_disperse
+        # 总损失：大幅降低分散性权重
+        total_loss = loss_s2p + 0.5 * loss_disperse  # 🔥 移除compact，降低disperse权重
         
         loss_dict = {
             'proto_s2p': loss_s2p.item(),
-            'proto_compact': loss_compact.item() if isinstance(loss_compact, torch.Tensor) else 0.0,
+            'proto_compact': 0.0,  # 已移除
             'proto_disperse': loss_disperse.item()
         }
         

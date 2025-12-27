@@ -18,22 +18,22 @@ class SpatialDomainModelGIB(BaseModuleClass):
     
     架构：
     1.单路GNN编码器（共享权重）
-    2.视图A:  空间KNN图（anchor view）
-    3.视图B: GIB剪枝后的图（learner view）
+    2.视图A:   空间KNN图（anchor view）
+    3.视图B:  GIB剪枝后的图（learner view）
     4.对比学习 + 原型学习 + 重构
     """
     
     def __init__(
         self,
-        n_input:  int,
-        n_output:  int,
-        hidden_dim: int = 256,
+        n_input:   int,
+        n_output:   int,
+        hidden_dim:  int = 256,
         latent_dim: int = 32,
         n_domains: int = 7,
         # GIB参数
-        gib_hidden:  int = 64,
-        gib_min_keep:  float = 0.4,
-        gib_max_keep:  float = 0.8,
+        gib_hidden:   int = 64,
+        gib_min_keep:  float = 0.05,  # 🔥 改为0.05
+        gib_sparsity_weight:  float = 0.5,  # 🔥 新增：GIB稀疏性损失权重
         # 对比学习参数
         contrastive_temperature: float = 0.1,
         contrastive_weight: float = 1.0,
@@ -44,7 +44,7 @@ class SpatialDomainModelGIB(BaseModuleClass):
         # 其他
         gnn_num_layers: int = 3,
         dropout: float = 0.1,
-        reconstruction_loss:  str = 'zinb',
+        reconstruction_loss:   str = 'zinb',
         **kwargs
     ):
         super().__init__()
@@ -55,13 +55,15 @@ class SpatialDomainModelGIB(BaseModuleClass):
         self.n_domains = n_domains
         self.contrastive_weight = contrastive_weight
         self.prototype_weight = prototype_weight
+        self.gib_sparsity_weight = gib_sparsity_weight  # 🔥 新增
         self.reconstruction_loss = reconstruction_loss
         
         print(f"\n🎯 GIB对比学习模型:")
         print(f"  - Input: {n_input}, Output: {n_output}")
-        print(f"  - Latent:  {latent_dim}, Domains: {n_domains}")
+        print(f"  - Latent:   {latent_dim}, Domains: {n_domains}")
         print(f"  - Contrastive weight: {contrastive_weight}")
-        print(f"  - Prototype weight: {prototype_weight}")
+        print(f"  - Prototype weight:  {prototype_weight}")
+        print(f"  - GIB sparsity weight: {gib_sparsity_weight}")  # 🔥 新增
         
         # 1.输入投影
         self.input_proj = nn.Sequential(
@@ -71,13 +73,12 @@ class SpatialDomainModelGIB(BaseModuleClass):
             nn.Dropout(dropout)
         )
         
-        # 2.GIB剪枝器
+        # 2.GIB剪枝器 - 🔥 使用新版本
         self.gib_pruner = GIBPruner(
             node_dim=n_input,
             hidden_dim=gib_hidden,
             min_keep_rate=gib_min_keep,
-            max_keep_rate=gib_max_keep,
-            temperature=0.5
+            temperature=0.3  # 🔥 提高温度
         )
         
         # 3.共享GNN编码器（DenseGCN）
@@ -150,7 +151,7 @@ class SpatialDomainModelGIB(BaseModuleClass):
         if distribution in ['nb', 'zinb']:
             self.px_r = nn.Parameter(torch.ones(n_output) * 4.0)
         
-        if distribution == 'zinb': 
+        if distribution == 'zinb':  
             self.decoder_dropout = nn.Sequential(
                 nn.Linear(hidden_dim // 2, n_output)
             )
@@ -173,7 +174,7 @@ class SpatialDomainModelGIB(BaseModuleClass):
         
         Returns:
             z_anchor: anchor view的latent
-            z_learner: learner view的latent
+            z_learner:  learner view的latent
             decoder_outputs: 解码器输出
             info: 统计信息
         """
@@ -184,8 +185,8 @@ class SpatialDomainModelGIB(BaseModuleClass):
         library_size = self._X_raw.sum(dim=1, keepdim=True)
         info = {}
         
-        # 1.GIB剪枝生成增强图
-        aug_edge_index, aug_edge_weight, keep_probs = self.gib_pruner(
+        # 1.GIB剪枝生成增强图 - 🔥 接收sparsity_loss
+        aug_edge_index, aug_edge_weight, keep_probs, sparsity_loss = self.gib_pruner(
             X_pca,
             self._spatial_edge_index,
             self._spatial_edge_weight
@@ -193,9 +194,10 @@ class SpatialDomainModelGIB(BaseModuleClass):
         
         info['gib_keep_rate'] = (keep_probs > 0.5).float().mean().item()
         info['gib_avg_prob'] = keep_probs.mean().item()
+        info['gib_sparsity_loss'] = sparsity_loss.item()  # 🔥 新增
         
         # 2.构建稠密邻接矩阵
-        # Anchor view:  原始空间图
+        # Anchor view:   原始空间图
         A_anchor = torch.zeros((N, N), device=device)
         A_anchor[self._spatial_edge_index[0], self._spatial_edge_index[1]] = self._spatial_edge_weight
         
@@ -216,6 +218,9 @@ class SpatialDomainModelGIB(BaseModuleClass):
         
         # 6.解码（使用anchor view）
         decoder_outputs = self._decode(z_anchor, library_size)
+        
+        # 🔥 将sparsity_loss传递出去
+        info['_gib_sparsity_loss_tensor'] = sparsity_loss
         
         return z_anchor, z_learner, decoder_outputs, info
     
@@ -252,7 +257,7 @@ class SpatialDomainModelGIB(BaseModuleClass):
             dist = NegativeBinomial(mu=px_rate, theta=px_r)
             recon_loss = -dist.log_prob(x_raw).sum(dim=-1)
         else:
-            raise ValueError(f"Unsupported loss: {self.reconstruction_loss}")
+            raise ValueError(f"Unsupported loss:  {self.reconstruction_loss}")
         
         return recon_loss
     
