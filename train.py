@@ -1198,7 +1198,7 @@ if __name__ == "__main__":
                         help='学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-5,
                         help='权重衰减')
-    parser.add_argument('--log_every', type=int, default=1,
+    parser.add_argument('--log_every', type=int, default=10,
                         help='日志打印频率')
     
     # 聚类参数
@@ -1227,3 +1227,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     main(args)
+# =======================================
+# 能达到比较好性能的参数(并不稳定)：
+# python train.py   --adata_path ../data/DLPFC/st/151673   --save_dir ./results/gib_contrastive_fix   --n_domains 7   --k_spatial 6   --hidden_dim 256   --latent_dim 32   
+# --prototype_dim 128   --gib_min_keep 0.4   --gib_max_keep 0.7   --contrastive_weight 2.0   --prototype_weight 20.0   --warmup_epochs 30   --max_epochs 300   --lr 5e-4   --seed 42
