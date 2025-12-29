@@ -76,53 +76,62 @@ def log(message):
 from src.modules.spatial_domain_model import SpatialDomainModelGIB  # 新模型
 
 
-def train_one_epoch_gib(model, X_pca, X_raw, optimizer, epoch, device, warmup_epochs=20):
-    """训练一个 epoch - GIB 版本（双重重构）"""
+def train_one_epoch_gib(model, X_pca, X_raw, optimizer, epoch, device, 
+                        warmup_epochs=20, gib_warmup_epochs=50):
+    """
+    训练一个 epoch - STAGUE 模式
+    
+    🔥 分阶段训练：
+    - Stage 1 (0-gib_warmup_epochs): 仅重构，GIB 关闭
+    - Stage 2 (gib_warmup_epochs-warmup_epochs): 重构 + GIB，对比学习关闭
+    - Stage 3 (warmup_epochs+): 完整训练（重构 + GIB + 对比 + 原型）
+    """
     model.train()
     
-    # 🔥 前向传播（现在返回 5 个值）
-    z_anchor, z_learner, decoder_outputs_anchor, decoder_outputs_learner, info = model.forward_all()
+    # 🔥 设置当前 epoch（用于模型内部判断是否在 GIB warmup 期）
+    model.set_epoch(epoch)
     
-    # 🔥 1.双重重构损失
-    recon_loss_anchor = model.compute_reconstruction_loss(decoder_outputs_anchor, X_raw).mean()
-    recon_loss_learner = model.compute_reconstruction_loss(decoder_outputs_learner, X_raw).mean()
+    # 前向传播（现在返回 4 个值）
+    z_anchor, z_learner, decoder_outputs, info = model.forward_all()
     
-    # 加权合并（Anchor 为主，Learner 为辅）
-    recon_loss = recon_loss_anchor + model.learner_recon_weight * recon_loss_learner
+    # 1.重构损失（始终启用）
+    recon_loss = model.compute_reconstruction_loss(decoder_outputs, X_raw).mean()
     
     if torch.isnan(recon_loss):
         log("⚠️ NaN detected in recon_loss")
         return {
             'total_loss': float('inf'),
             'recon_loss': float('inf'),
-            'recon_loss_anchor': float('inf'),
-            'recon_loss_learner': float('inf'),  # 🔥 NEW
             'contrastive_loss': 0.0,
             'prototype_loss': 0.0,
-            'gib_sparsity_loss':  0.0,
-            'spatial_consistency_loss': 0.0,
+            'gib_sparsity_loss': 0.0,
             'in_warmup': True,
+            'in_gib_warmup': True,
             **info
         }
     
+    in_gib_warmup = epoch < gib_warmup_epochs
     in_warmup = epoch < warmup_epochs
     
-    # 🔥 2.GIB 稀疏性损失（从第一个 epoch 就启动）
-    gib_sparsity_loss = info['_gib_sparsity_loss_tensor'] * model.gib_sparsity_weight
+    # 🔥 2.GIB 稀疏性损失（仅在 GIB warmup 后启用）
+    if in_gib_warmup:
+        gib_sparsity_loss = torch.tensor(0.0, device=device)
+    else:
+        gib_sparsity_loss = info['_gib_sparsity_loss_tensor'] * model.gib_sparsity_weight
     
-    # 3.对比学习损失（warmup 后启动）
+    # 3.对比学习损失（仅在完整 warmup 后启用）
     if not in_warmup:
         contrastive_loss = model.compute_contrastive_loss(z_anchor, z_learner)
         contrastive_loss = contrastive_loss * model.contrastive_weight
     else:
         contrastive_loss = torch.tensor(0.0, device=device)
     
-    # 4.原型损失（warmup 后）
+    # 4.原型损失（仅在完整 warmup 后启用）
     if in_warmup:
         prototype_loss = torch.tensor(0.0, device=device)
-        spatial_consistency_loss = torch.tensor(0.0, device=device)
-        proto_loss_dict = {'proto_s2p':  0.0, 'proto_compact': 0.0, 'proto_disperse': 0.0}
-        # 🔥 warmup 期：双重重构 + GIB 稀疏性
+        proto_loss_dict = {'proto_s2p': 0.0, 'proto_compact': 0.0, 'proto_disperse': 0.0}
+        
+        # 🔥 Warmup 期：只有重构 + GIB（如果已过 GIB warmup）
         total_loss = recon_loss + gib_sparsity_loss
     
     elif epoch == warmup_epochs:
@@ -132,27 +141,24 @@ def train_one_epoch_gib(model, X_pca, X_raw, optimizer, epoch, device, warmup_ep
         log("="*80)
         
         with torch.no_grad():
-            z_init, _, _, _, _ = model.forward_all()  # 🔥 注意：5 个返回值
+            model.set_epoch(epoch)
+            z_init, _, _, _ = model.forward_all()
             z_proto = model.latent_to_prototype(z_init)
             model.prototypes.initialize_with_kmeans(z_proto)
         
         prototype_loss = torch.tensor(0.0, device=device)
-        spatial_consistency_loss = torch.tensor(0.0, device=device)
         proto_loss_dict = {'proto_s2p': 0.0, 'proto_compact': 0.0, 'proto_disperse': 0.0}
-        # 🔥 初始化 epoch：重构 + 对比 + GIB
-        total_loss = recon_loss + contrastive_loss + gib_sparsity_loss
+        
+        # 初始化 epoch：重构 + GIB + 对比
+        total_loss = recon_loss + gib_sparsity_loss + contrastive_loss
     
     else:
+        # 完整训练期
         prototype_loss, proto_loss_dict, Q = model.compute_prototype_loss(z_anchor)
         prototype_loss = prototype_loss * model.prototype_weight
         
-        # 空间一致性损失
-        spatial_consistency_loss = model.compute_spatial_consistency_loss(Q)
-        spatial_consistency_loss = spatial_consistency_loss * model.spatial_consistency_weight
-        
-        # 🔥 完整训练：双重重构 + 对比 + 原型 + GIB + 空间一致性
-        total_loss = (recon_loss + contrastive_loss + prototype_loss + 
-                     gib_sparsity_loss + spatial_consistency_loss)
+        # 完整损失
+        total_loss = recon_loss + gib_sparsity_loss + contrastive_loss + prototype_loss
     
     # 反向传播
     optimizer.zero_grad()
@@ -160,23 +166,21 @@ def train_one_epoch_gib(model, X_pca, X_raw, optimizer, epoch, device, warmup_ep
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     
-    # 🔥 返回完整指标
+    # 返回完整指标
     metrics = {
         'total_loss': total_loss.item(),
         'recon_loss': recon_loss.item(),
-        'recon_loss_anchor':  recon_loss_anchor.item(),  # 🔥 NEW
-        'recon_loss_learner': recon_loss_learner.item(),  # 🔥 NEW
-        'contrastive_loss':  contrastive_loss.item() if not in_warmup else 0.0,
+        'contrastive_loss': contrastive_loss.item() if not in_warmup else 0.0,
         'prototype_loss': prototype_loss.item(),
         'gib_sparsity_loss': gib_sparsity_loss.item(),
-        'spatial_consistency_loss': spatial_consistency_loss.item() if not in_warmup else 0.0,
-        'in_warmup': in_warmup,
+        'in_warmup':  in_warmup,
+        'in_gib_warmup':  in_gib_warmup,
         **proto_loss_dict,
         **{k: v for k, v in info.items() if not k.startswith('_')}
     }
     
     # Dispersion 参数统计
-    if model.reconstruction_loss in ['nb', 'zinb']:
+    if model.reconstruction_loss in ['nb', 'zinb']: 
         if hasattr(model, 'px_r'):
             px_r = torch.exp(model.px_r)
             metrics['px_r_mean'] = px_r.mean().item()
@@ -189,7 +193,7 @@ def train_one_epoch_gib(model, X_pca, X_raw, optimizer, epoch, device, warmup_ep
 # ========================================
 def plot_training_curves_gib(history_df, save_dir):
     """绘制训练曲线 - GIB版本"""
-    fig, axes = plt.subplots(2, 4, figsize=(24, 10))  # 🔥 改为2x4布局
+    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
     
     # 1.总损失
     ax = axes[0, 0]
@@ -253,39 +257,28 @@ def plot_training_curves_gib(history_df, save_dir):
         ax.text(0.5, 0.5, 'No GIB stats', ha='center', va='center')
         ax.axis('off')
     
-    # 🔥 6.NEW: 空间一致性损失
+    # 6.GIB稀疏性损失
     ax = axes[1, 1]
-    if 'spatial_consistency_loss' in history_df.columns:
-        non_warmup = history_df[~history_df.get('in_warmup', False)]
-        if len(non_warmup) > 0 and (non_warmup['spatial_consistency_loss'] > 0).any():
-            ax.plot(non_warmup['epoch'], non_warmup['spatial_consistency_loss'], 
-                   linewidth=2, color='teal')
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Spatial Consistency Loss')
-            ax.set_title('Spatial Consistency Loss')
-            ax.grid(True, alpha=0.3)
-    else:
-        ax.text(0.5, 0.5, 'No spatial consistency loss', ha='center', va='center')
-        ax.axis('off')
-    
-    # 7.GIB稀疏性损失
-    ax = axes[1, 2]
     if 'gib_sparsity_loss' in history_df.columns:
         ax.plot(history_df['epoch'], history_df['gib_sparsity_loss'], 
                linewidth=2, color='brown')
         ax.set_xlabel('Epoch')
         ax.set_ylabel('GIB Sparsity Loss')
-        ax.set_title('GIB Sparsity Loss (Entropy)')
+        ax.set_title('GIB Sparsity Loss')
         ax.grid(True, alpha=0.3)
     
-    # 8.学习率
-    ax = axes[1, 3]
+    # 7.学习率
+    ax = axes[1, 2]
     ax.plot(history_df['epoch'], history_df['lr'], linewidth=2, color='blue')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Learning Rate')
     ax.set_title('Learning Rate Schedule')
     ax.set_yscale('log')
     ax.grid(True, alpha=0.3)
+    
+    # 8.空位（可用于其他指标）
+    ax = axes[1, 3]
+    ax.axis('off')
     
     plt.tight_layout()
     
@@ -361,7 +354,7 @@ def plot_spatial_comparison(adata, save_dir, spatial_key='spatial'):
             gt_column = col
             break
     
-    if gt_column is None:  
+    if gt_column is None: 
         log("  ⚠️ 没有ground truth，跳过对比可视化")
         return
     
@@ -376,7 +369,7 @@ def plot_spatial_comparison(adata, save_dir, spatial_key='spatial'):
     fig = plt.figure(figsize=(20, 6))
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 子图1: Ground Truth
+    # 子图1:  Ground Truth
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     ax1 = plt.subplot(1, 3, 1)
     
@@ -384,9 +377,9 @@ def plot_spatial_comparison(adata, save_dir, spatial_key='spatial'):
     layer_colors = {
         'Layer1': '#F8766D',
         'Layer2':  '#B79F00',
-        'Layer3':  '#00BA38',
+        'Layer3': '#00BA38',
         'Layer4': '#00BFC4',
-        'Layer5':  '#619CFF',
+        'Layer5': '#619CFF',
         'Layer6': '#F564E3',
         'WM': '#999999'
     }
@@ -486,105 +479,6 @@ def plot_spatial_comparison(adata, save_dir, spatial_key='spatial'):
     log(f"  ✅ 保存空间对比图到 {save_path}")
 
 
-def plot_training_curves(history_df, save_dir):
-    """绘制训练曲线"""
-    fig, axes = plt.subplots(3, 3, figsize=(21, 15))
-    
-    # 总损失
-    ax = axes[0, 0]
-    ax.plot(history_df['epoch'], history_df['total_loss'], linewidth=2)
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Total Loss')
-    ax.set_title('Training Loss')
-    ax.grid(True, alpha=0.3)
-    
-    # 重构损失
-    ax = axes[0, 1]
-    ax.plot(history_df['epoch'], history_df['recon_loss'], linewidth=2, color='orange')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Reconstruction Loss')
-    ax.set_title('Reconstruction Loss')
-    ax.grid(True, alpha=0.3)
-    
-    # 原型损失（如果有）
-    ax = axes[1, 0]
-    if 'prototype_loss' in history_df.columns:
-        # 只绘制非warmup期
-        non_warmup = history_df[~history_df.get('in_warmup', False)]
-        if len(non_warmup) > 0:
-            ax.plot(non_warmup['epoch'], non_warmup['prototype_loss'], 
-                   linewidth=2, color='green')
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Prototype Loss')
-            ax.set_title('Prototype Loss (after warmup)')
-            ax.grid(True, alpha=0.3)
-    else:
-        ax.text(0.5, 0.5, 'No prototype loss', ha='center', va='center')
-        ax.axis('off')
-    
-    # 学习率
-    ax = axes[1, 1]
-    ax.plot(history_df['epoch'], history_df['lr'], linewidth=2, color='red')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Learning Rate')
-    ax.set_title('Learning Rate Schedule')
-    ax.set_yscale('log')
-    ax.grid(True, alpha=0.3)
-
-    # 🔥 新增子图：Anchor vs Learner 重构损失对比
-    ax = axes[2, 0]
-    if 'recon_loss_anchor' in history_df.columns and 'recon_loss_learner' in history_df.columns:
-        ax.plot(history_df['epoch'], history_df['recon_loss_anchor'], 
-               linewidth=2, label='Anchor', color='blue')
-        ax.plot(history_df['epoch'], history_df['recon_loss_learner'], 
-               linewidth=2, label='Learner (GIB)', color='red', linestyle='--')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Reconstruction Loss')
-        ax.set_title('Anchor vs Learner Reconstruction')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    save_path = Path(save_dir) / 'training_curves.png'
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    log(f"  ✅ 保存训练曲线到 {save_path}")
-
-
-def plot_gate_weights(history_df, save_dir):
-    """绘制门控权重变化"""
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    if 'gate_spatial' in history_df.columns:
-        ax.plot(history_df['epoch'], history_df['gate_spatial'], 
-               label='Spatial', linewidth=2)
-    
-    if 'gate_learned' in history_df.columns:
-        ax.plot(history_df['epoch'], history_df['gate_learned'], 
-               label='Learned Graph', linewidth=2)
-    
-    if 'gate_expr' in history_df.columns:
-        ax.plot(history_df['epoch'], history_df['gate_expr'], 
-               label='Expression', linewidth=2)
-    
-    ax.set_xlabel('Epoch', fontsize=12)
-    ax.set_ylabel('Gate Weight', fontsize=12)
-    ax.set_title('Gating Weights Evolution', fontsize=14, fontweight='bold')
-    ax.legend(frameon=False, fontsize=10)
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim([0, 1])
-    
-    plt.tight_layout()
-    
-    save_path = Path(save_dir) / 'gate_weights.png'
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    log(f"  ✅ 保存门控权重图到 {save_path}")
-
-
 def plot_cluster_distribution(adata, save_dir):
     """绘制聚类分布条形图"""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -598,7 +492,7 @@ def plot_cluster_distribution(adata, save_dir):
             gt_column = col
             break
     
-    if gt_column:  
+    if gt_column: 
         gt_counts = adata.obs[gt_column].value_counts().sort_index()
         gt_counts = gt_counts[gt_counts.index != 'NA']
         
@@ -743,13 +637,12 @@ def main(args):
         gib_min_keep=args.gib_min_keep,
         gib_max_keep=args.gib_max_keep,
         gib_sparsity_weight=args.gib_sparsity_weight,
+        gib_warmup_epochs=args.gib_warmup_epochs,  # 🔥 NEW
         contrastive_temperature=args.contrastive_temp,
         contrastive_weight=args.contrastive_weight,
         prototype_dim=args.prototype_dim,
         prototype_temperature=args.prototype_temp,
         prototype_weight=args.prototype_weight,
-        learner_recon_weight=args.learner_recon_weight,  # 🔥 NEW
-        spatial_consistency_weight=args.spatial_consistency_weight,
         gnn_num_layers=args.gnn_num_layers,
         dropout=args.dropout,
         reconstruction_loss=args.reconstruction_loss
@@ -765,7 +658,7 @@ def main(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f"  参数量: {n_params:,}")
     
-        # ========================================
+    # ========================================
     # 优化器和调度器
     # ========================================
     optimizer = torch.optim.AdamW(
@@ -785,10 +678,10 @@ def main(args):
     # ========================================
     log("\n🏋️ 开始训练...")
     log("=" * 80)
-    log(f"🔥 Warmup期:    Epoch 1-{args.warmup_epochs} (只训练重构 + GIB)")
-    log(f"🔥 对比学习启动:   Epoch {args.warmup_epochs + 1}")
-    log(f"🔥 初始化原型:   Epoch {args.warmup_epochs + 1} (K-Means)")
-    log(f"🔥 完整训练:  Epoch {args.warmup_epochs + 2}-{args.max_epochs} (+ 空间一致性)")
+    log(f"🔥 Stage 1 (GIB Warmup):  Epoch 1-{args.gib_warmup_epochs} (仅重构)")
+    log(f"🔥 Stage 2 (开启 GIB):    Epoch {args.gib_warmup_epochs + 1}-{args.warmup_epochs} (重构 + GIB)")
+    log(f"🔥 Stage 3 (开启对比):    Epoch {args.warmup_epochs + 1}-{args.max_epochs} (完整训练)")
+    log(f"🔥 初始化原型:             Epoch {args.warmup_epochs + 1} (K-Means)")
     log("=" * 80)
     
     best_loss = float('inf')
@@ -805,7 +698,8 @@ def main(args):
             optimizer,
             epoch,
             device,
-            warmup_epochs=args.warmup_epochs
+            warmup_epochs=args.warmup_epochs,
+            gib_warmup_epochs=args.gib_warmup_epochs  # 🔥 NEW
         )
         
         # 更新学习率
@@ -821,57 +715,52 @@ def main(args):
         # ========================================
         # 打印日志
         # ========================================
-        # 打印日志
         if (epoch + 1) % args.log_every == 0:
             log(f"\n{'='*80}")
             
-            if metrics.get('in_warmup', False):
+            # 🔥 显示当前训练阶段
+            if metrics.get('in_gib_warmup', False):
+                log(f"Epoch {epoch+1}/{args.max_epochs} [GIB WARMUP] ({epoch_time:.2f}s)")
+            elif metrics.get('in_warmup', False):
                 log(f"Epoch {epoch+1}/{args.max_epochs} [WARMUP] ({epoch_time:.2f}s)")
             else:
-                log(f"Epoch {epoch+1}/{args.max_epochs} ({epoch_time:.2f}s)")
+                log(f"Epoch {epoch+1}/{args.max_epochs} [FULL TRAINING] ({epoch_time:.2f}s)")
             
             log(f"{'='*80}")
-            log(f"  Total Loss:                {metrics['total_loss']:.4f}")
-            log(f"  Recon Loss (Total):       {metrics['recon_loss']:.4f}")
-            log(f"    - Anchor:               {metrics['recon_loss_anchor']:.4f}")  # 🔥 NEW
-            log(f"    - Learner:              {metrics['recon_loss_learner']:.4f}")  # 🔥 NEW
+            log(f"  Total Loss:               {metrics['total_loss']:.4f}")
+            log(f"  Recon Loss:              {metrics['recon_loss']:.4f}")
             
             # GIB 稀疏性损失
-            if 'gib_sparsity_loss' in metrics:
-                log(f"  🔥 GIB Sparsity Loss:     {metrics['gib_sparsity_loss']:.4f}")
+            if not metrics.get('in_gib_warmup', False) and 'gib_sparsity_loss' in metrics:
+                log(f"  🔥 GIB Sparsity Loss:    {metrics['gib_sparsity_loss']:.4f}")
             
             # 对比学习损失
-            if not metrics.get('in_warmup', False) and 'contrastive_loss' in metrics:
-                log(f"  🔥 Contrastive Loss:      {metrics['contrastive_loss']:.4f}")
+            if not metrics.get('in_warmup', False) and 'contrastive_loss' in metrics: 
+                log(f"  🔥 Contrastive Loss:     {metrics['contrastive_loss']:.4f}")
             
             # 原型学习损失
             if not metrics.get('in_warmup', False) and metrics.get('prototype_loss', 0) > 0:
-                log(f"  🔥 Prototype Loss:        {metrics['prototype_loss']:.4f}")
+                log(f"  🔥 Prototype Loss:       {metrics['prototype_loss']:.4f}")
                 
                 if 'proto_s2p' in metrics and metrics['proto_s2p'] > 0:
-                    log(f"    - Spot-to-Prototype:     {metrics['proto_s2p']:.4f}")
-                    log(f"    - Compactness:          {metrics['proto_compact']:.4f}")
-                    log(f"    - Dispersion:           {metrics['proto_disperse']:.4f}")
-            
-            # 空间一致性损失
-            if not metrics.get('in_warmup', False) and 'spatial_consistency_loss' in metrics:
-                log(f"  🔥 Spatial Consistency:    {metrics['spatial_consistency_loss']:.4f}")
+                    log(f"    - Spot-to-Prototype:    {metrics['proto_s2p']:.4f}")
+                    log(f"    - Dispersion:          {metrics['proto_disperse']:.4f}")
             
             # GIB 统计
-            if 'gib_keep_rate' in metrics:
-                log(f"  GIB Keep Rate:            {metrics['gib_keep_rate']:.3f}")
-                log(f"  GIB Avg Prob:             {metrics['gib_avg_prob']:.3f}")
+            if 'gib_keep_rate' in metrics: 
+                log(f"  GIB Keep Rate:           {metrics['gib_keep_rate']:.3f}")
+                log(f"  GIB Avg Prob:            {metrics['gib_avg_prob']:.3f}")
             
             # Dispersion 参数
             if 'px_r_mean' in metrics: 
-                log(f"  Dispersion (θ):           {metrics['px_r_mean']:.3f} ± {metrics['px_r_std']:.3f}")
+                log(f"  Dispersion (θ):          {metrics['px_r_mean']:.3f} ± {metrics['px_r_std']:.3f}")
             
-            log(f"  Learning Rate:             {metrics['lr']:.6f}")
+            log(f"  Learning Rate:            {metrics['lr']:.6f}")
         
         # ========================================
         # 保存最佳模型
         # ========================================
-        if metrics['total_loss'] < best_loss:
+        if metrics['total_loss'] < best_loss: 
             best_loss = metrics['total_loss']
             best_model_path = Path(args.save_dir) / 'best_model.pt'
             
@@ -881,7 +770,7 @@ def main(args):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
-                'args':  vars(args),
+                'args': vars(args),
                 'seed': args.seed,
                 'history': history
             }, best_model_path)
@@ -1278,11 +1167,12 @@ if __name__ == "__main__":
     # GIB 参数
     parser.add_argument('--gib_hidden', type=int, default=64)
     parser.add_argument('--gib_min_keep', type=float, default=0.05)
-    parser.add_argument('--gib_max_keep', type=float, default=0.7)  # 🔥 从 0.8 降到 0.7
-    parser.add_argument('--gib_sparsity_weight', type=float, default=0.5)  # 🔥 从 1.0 降到 0.5
+    parser.add_argument('--gib_max_keep', type=float, default=0.7)  
+    parser.add_argument('--gib_sparsity_weight', type=float, default=0.5)
+    parser.add_argument('--gib_warmup_epochs', type=int, default=50,  # 🔥 NEW
+                    help='GIB 预热期：前 N 个 epoch 不启用 GIB 剪枝')
 
-    # 双重重构参数
-    parser.add_argument('--learner_recon_weight', type=float, default=1.0)  # 🔥 从 0.5 提高到 1.0
+
     # 🔥 对比学习参数
     parser.add_argument('--contrastive_temp', type=float, default=0.1)
     parser.add_argument('--contrastive_weight', type=float, default=1.0)
@@ -1295,8 +1185,6 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
     
-    parser.add_argument('--spatial_consistency_weight', type=float, default=0.1,
-                        help='空间一致性损失权重')  # 🔥 NEW
     
     args = parser.parse_args()
     

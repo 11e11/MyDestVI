@@ -1,24 +1,35 @@
-"""GIB (Graph Information Bottleneck) 剪枝模块 - 救援版"""
+"""GIB (Graph Information Bottleneck) 剪枝模块 - 语义感知版（STAGUE 模式）"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class GIBPruner(nn.Module):
+    """
+    语义感知的 GIB 剪枝器
+    
+    🔥 核心改进：
+    - 输入改为编码后的语义特征（不再是原始 PCA）
+    - 计算语义距离（不再是物理特征距离）
+    - 更准确地识别跨层边界
+    """
+    
     def __init__(
         self,
-        node_dim: int,
+        node_dim: int,  # 语义特征维度（hidden_dim）
         hidden_dim: int = 64,
         min_keep_rate: float = 0.05,
-        max_keep_rate: float = 0.8, # 这个参数现在只用于 Top-K 截断
-        temperature: float = 0.3
+        max_keep_rate: float = 0.8,
+        temperature: float = 0.3,
+        use_soft_mask: bool = True
     ):
         super().__init__()
         
         self.min_keep_rate = min_keep_rate
         self.max_keep_rate = max_keep_rate
         self.temperature = temperature
+        self.use_soft_mask = use_soft_mask
         
-        # 边特征提取器
+        # 🔥 边特征提取器（输入是语义特征）
         self.edge_scorer = nn.Sequential(
             nn.Linear(node_dim * 2 + node_dim + 1, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -26,72 +37,95 @@ class GIBPruner(nn.Module):
             nn.Dropout(0.05),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            # 最后一层：输出 Logits
             nn.Linear(hidden_dim // 2, 1)
         )
         
-        # 🔥🔥🔥 关键救命修改：初始化偏置为 +3.0
-        # Sigmoid(3.0) ≈ 0.95
-        # 即使经过 Linear 初始化波动，也能保证初始概率 > 0.5
-        # 确保训练开始时，图是连通的！
-        nn.init.constant_(self.edge_scorer[-1].bias, 0.0)
+        # 🔥 初始化偏置为 +3.0（确保训练开始时保留大部分边）
+        nn.init.constant_(self.edge_scorer[-1].bias, 3.0)
         
-        print(f"🔥 GIB Pruner (救援版):")
-        print(f"  - Init Bias: +3.0 (Start Fully Connected)")
-        print(f"  - Hard Pruning limit: {max_keep_rate}")
-        print(f"  - Loss: Mean L1")
+        print(f"🔥 GIB Pruner (语义感知版 - STAGUE):")
+        print(f"  - Input:  Semantic Features (from Encoder)")
+        print(f"  - Init Bias: +3.0 -> P(keep) ≈ 0.95")
+        print(f"  - Max Keep Rate: {max_keep_rate} (软约束)")
+        print(f"  - Use Soft Mask: {use_soft_mask}")
 
-    def compute_edge_features(self, x, edge_index):
+    def compute_edge_features(self, h_semantic, edge_index):
+        """
+        计算边特征（基于语义特征）
+        
+        Args:
+            h_semantic: [N, hidden_dim] 语义特征（来自 Encoder）
+            edge_index: [2, E] 边索引
+        """
         src, dst = edge_index[0], edge_index[1]
-        x_src, x_dst = x[src], x[dst]
-        edge_feats_concat = torch.cat([x_src, x_dst], dim=-1)
-        edge_feats_diff = torch.abs(x_src - x_dst)
-        cos_sim = F.cosine_similarity(x_src, x_dst, dim=-1).unsqueeze(-1)
+        h_src, h_dst = h_semantic[src], h_semantic[dst]
+        
+        # 1.拼接语义特征
+        edge_feats_concat = torch.cat([h_src, h_dst], dim=-1)
+        
+        # 2.语义差异（L1）
+        edge_feats_diff = torch.abs(h_src - h_dst)
+        
+        # 3.语义相似度（余弦）
+        cos_sim = F.cosine_similarity(h_src, h_dst, dim=-1).unsqueeze(-1)
+        
         return torch.cat([edge_feats_concat, edge_feats_diff, cos_sim], dim=-1)
     
-    def compute_edge_scores(self, x, edge_index):
-        edge_feats = self.compute_edge_features(x, edge_index)
+    def compute_edge_scores(self, h_semantic, edge_index):
+        """计算边的保留概率"""
+        edge_feats = self.compute_edge_features(h_semantic, edge_index)
         logits = self.edge_scorer(edge_feats).squeeze(-1)
         
-        # 🔥 修改：让 keep_probs 能够达到 1.0 (表示连接强度)
-        # 不要在这里用 max_keep_rate 限制它，否则会误杀
+        # Sigmoid + 缩放到 [min_keep_rate, 1.0]
         keep_probs = torch.sigmoid(logits / self.temperature)
         keep_probs = self.min_keep_rate + (1.0 - self.min_keep_rate) * keep_probs
         
         return keep_probs, logits
     
-    def forward(self, x, spatial_edge_index, spatial_edge_weight=None):
-        keep_probs, _ = self.compute_edge_scores(x, spatial_edge_index)
+    def forward(self, h_semantic, spatial_edge_index, spatial_edge_weight=None):
+        """
+        前向传播（语义感知版）
         
-        # 1. 生成 Mask
-        if self.training:
-            # 训练时：Bernoulli 采样 (随机性)
-            keep_mask = torch.bernoulli(keep_probs).bool()
+        Args:
+            h_semantic: [N, hidden_dim] 语义特征（来自 Anchor 编码器）
+            spatial_edge_index: [2, E] 原始空间图的边索引
+            spatial_edge_weight: [E] 原始边权重
+        
+        Returns:
+            aug_edge_index: 剪枝后的边索引
+            aug_edge_weight:  剪枝后的边权重
+            keep_probs: 保留概率
+            sparsity_loss: 稀疏性损失
+        """
+        keep_probs, _ = self.compute_edge_scores(h_semantic, spatial_edge_index)
+        num_edges = keep_probs.size(0)
+        
+        # 1.训练时：软权重（不采样）
+        if self.training and self.use_soft_mask:
+            keep_mask = keep_probs > self.min_keep_rate
         else:
             # 推理时：硬截断
             keep_mask = keep_probs > 0.5
-            
-        # 2. 🔥 强制 Top-K 截断 (Budget Control)
-        # 只有在这里使用 max_keep_rate 来控制数量，而不是限制强度
-        if self.max_keep_rate < 1.0:
-            current_keep_rate = keep_probs.mean() # 检查平均保留率
-            if current_keep_rate > self.max_keep_rate:
-                # 找出阈值
-                num_edges = keep_probs.size(0)
-                k = int(num_edges * self.max_keep_rate)
-                # 使用负值求 topk 来找第 k 大
-                threshold = torch.kthvalue(keep_probs, num_edges - k + 1).values
-                # 只有概率足够大的才保留
-                keep_mask = keep_mask & (keep_probs >= threshold)
-
-        aug_edge_index = spatial_edge_index[:, keep_mask]
         
+        # 2.自适应 Top-K 截断（软约束）
+        if self.max_keep_rate < 1.0:
+            actual_keep_rate = keep_mask.float().mean().item()
+            
+            if actual_keep_rate > self.max_keep_rate:
+                k = int(num_edges * self.max_keep_rate)
+                threshold = torch.kthvalue(keep_probs, num_edges - k + 1).values
+                keep_mask = keep_mask & (keep_probs >= threshold)
+        
+        # 3.应用 mask
+        aug_edge_index = spatial_edge_index[: , keep_mask]
+        
+        # 4.边权重 = 原始权重 × 保留概率
         if spatial_edge_weight is not None:
             aug_edge_weight = spatial_edge_weight[keep_mask] * keep_probs[keep_mask]
-        else:
+        else: 
             aug_edge_weight = keep_probs[keep_mask]
         
-        # L1 Loss
+        # 5.稀疏性损失（L1 正则）
         sparsity_loss = keep_probs.mean()
         
         return aug_edge_index, aug_edge_weight, keep_probs, sparsity_loss
