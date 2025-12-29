@@ -1,102 +1,102 @@
-"""空间域识别模型 - STAGUE 模式（语义感知 GIB）"""
+"""空间域识别模型 - Attention-GIB + 双视图对比学习（修复版）"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scvi.module.base import BaseModuleClass
+from torch_geometric.nn import GCNConv
 
-from .gib_pruner import GIBPruner
+from .gib_pruner import AttentionGIBPruner
 from .contrasive_loss import NodeContrastiveLoss
-from .dense_gcn import DenseGCNEncoder
-from .prototype_learning import LearnablePrototypes, PrototypeLoss
 
 
-class SpatialDomainModelGIB(BaseModuleClass):
+class SpatialDomainModel(nn.Module):
     """
-    STAGUE 模式：语义感知的 GIB 剪枝
+    Attention-GIB 双视图对比学习模型（修复版）
     
     🔥 核心改进：
-    1.第一步：在原始图上编码，得到语义特征（Anchor）
-    2.第二步：用语义特征指导 GIB 剪枝，生成 Learner 图
-    3.第三步：在 Learner 图上二次编码，得到纯净特征（Learner）
+    1.边权重与 Attention Prob 解耦
+    2.引入 Entropy Loss 促进二元决策
     """
     
     def __init__(
         self,
         n_input:  int,
-        n_output: int,
+        n_output:  int,
         hidden_dim: int = 256,
         latent_dim: int = 32,
-        n_domains: int = 7,
-        # GIB 参数
-        gib_hidden:  int = 64,
-        gib_min_keep:  float = 0.05,
-        gib_max_keep:  float = 0.8,
-        gib_sparsity_weight: float = 1.0,
-        gib_warmup_epochs: int = 50,  # 🔥 NEW: GIB 预热期
-        # 对比学习参数
-        contrastive_temperature: float = 0.1,
-        contrastive_weight: float = 1.0,
-        # 原型学习参数
-        prototype_dim: int = 128,
-        prototype_temperature: float = 0.15,
-        prototype_weight: float = 20.0,
-        # 其他
+        # Attention-GIB 参数
+        gib_num_heads: int = 4,
+        gib_temperature: float = 1.0,
+        gib_use_gumbel: bool = True,
+        gib_gumbel_tau: float = 0.5,
+        gib_entropy_weight: float = 0.01,  # 🔥 NEW
+        # GCN 参数
         gnn_num_layers: int = 3,
-        dropout:  float = 0.1,
-        reconstruction_loss: str = 'zinb',
+        dropout: float = 0.1,
+        # 损失权重
+        contrastive_weight: float = 1.0,
+        contrastive_temperature: float = 0.1,
+        reconstruction_weight: float = 1.0,
+        gib_loss_weight: float = 0.1,  # 🔥 改名：原 sparsity_weight
+        # 重构损失类型
+        reconstruction_loss:  str = 'zinb',
         **kwargs
     ):
         super().__init__()
         
         self.n_input = n_input
         self.n_output = n_output
+        self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
-        self.n_domains = n_domains
         self.contrastive_weight = contrastive_weight
-        self.prototype_weight = prototype_weight
-        self.gib_sparsity_weight = gib_sparsity_weight
-        self.gib_warmup_epochs = gib_warmup_epochs  # 🔥 NEW
+        self.reconstruction_weight = reconstruction_weight
+        self.gib_loss_weight = gib_loss_weight
         self.reconstruction_loss = reconstruction_loss
         
-        # 🔥 用于跟踪当前 epoch
-        self.register_buffer("current_epoch", torch.tensor(0, dtype=torch.long))
+        print(f"\n🎯 Attention-GIB 双视图对比学习模型 (修复版):")
+        print(f"  - Input (PCA): {n_input}, Output (Genes): {n_output}")
+        print(f"  - Hidden:  {hidden_dim}, Latent: {latent_dim}")
+        print(f"  - GNN Layers: {gnn_num_layers}")
+        print(f"  - Contrastive Weight:  {contrastive_weight}")
+        print(f"  - Reconstruction Weight: {reconstruction_weight}")
+        print(f"  - GIB Loss Weight: {gib_loss_weight}")
+        print(f"  - 🔥 边权重与 Prob 解耦")
         
-        print(f"\n🎯 STAGUE 模式（语义感知 GIB）:")
-        print(f"  - Input: {n_input}, Output: {n_output}")
-        print(f"  - Latent:  {latent_dim}, Domains: {n_domains}")
-        print(f"  - 🔥 GIB Warmup: {gib_warmup_epochs} epochs")
-        print(f"  - Contrastive weight: {contrastive_weight}")
-        print(f"  - Prototype weight: {prototype_weight}")
-        print(f"  - GIB sparsity weight: {gib_sparsity_weight}")
-        
-        # 1.输入投影
-        self.input_proj = nn.Sequential(
+        # Step 2: 基础特征投影
+        self.shared_encoder = nn.Sequential(
             nn.Linear(n_input, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU()
         )
         
-        # 2.🔥 GIB 剪枝器（输入是 hidden_dim 的语义特征）
-        self.gib_pruner = GIBPruner(
-            node_dim=hidden_dim,  # 🔥 改为 hidden_dim（不再是 n_input）
-            hidden_dim=gib_hidden,
-            min_keep_rate=gib_min_keep,
-            max_keep_rate=gib_max_keep,
-            temperature=0.3,
-            use_soft_mask=True
+        # Step 3: Attention-GIB 剪枝模块
+        self.attention_gib = AttentionGIBPruner(
+            node_dim=hidden_dim,
+            num_heads=gib_num_heads,
+            dropout=dropout,
+            temperature=gib_temperature,
+            use_gumbel=gib_use_gumbel,
+            gumbel_tau=gib_gumbel_tau,
+            entropy_weight=gib_entropy_weight  # 🔥 NEW
         )
         
-        # 3.共享 GNN 编码器
-        self.gnn_encoder = DenseGCNEncoder(
-            in_channels=hidden_dim,
-            hidden_channels=hidden_dim,
-            out_channels=hidden_dim,
-            num_layers=gnn_num_layers,
-            dropout=dropout
-        )
+        # Step 4: 双视图 GCN 编码器
+        self.gcn_layers = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
         
-        # 4.投影到 Latent
+        self.gcn_layers.append(GCNConv(hidden_dim, hidden_dim))
+        self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+        
+        for _ in range(gnn_num_layers - 1):
+            self.gcn_layers.append(GCNConv(hidden_dim, hidden_dim))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+        
+        self.dropout = nn.Dropout(dropout)
+        
+        # 投影到 Latent 空间
         self.to_latent = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
@@ -105,29 +105,13 @@ class SpatialDomainModelGIB(BaseModuleClass):
             nn.Linear(hidden_dim // 2, latent_dim)
         )
         
-        # 5.原型学习
-        self.latent_to_prototype = nn.Sequential(
-            nn.Linear(latent_dim, prototype_dim),
-            nn.ReLU(),
-            nn.Linear(prototype_dim, prototype_dim)
-        )
-        
-        self.prototypes = LearnablePrototypes(
-            n_prototypes=n_domains,
-            prototype_dim=prototype_dim,
-            temperature=prototype_temperature,
-            momentum=0.99
-        )
-        
-        self.prototype_loss_fn = PrototypeLoss(temperature=prototype_temperature)
-        
-        # 6.对比学习损失
+        # Step 5: 损失函数
         self.contrastive_loss_fn = NodeContrastiveLoss(
             temperature=contrastive_temperature,
             negative_mode='all'
         )
         
-        # 7.解码器（仅用于 Anchor）
+        # 重构解码器
         self._build_decoder(latent_dim, n_output, hidden_dim, dropout, reconstruction_loss)
         
         # Buffers
@@ -157,7 +141,7 @@ class SpatialDomainModelGIB(BaseModuleClass):
         if distribution in ['nb', 'zinb']:
             self.px_r = nn.Parameter(torch.ones(n_output) * 4.0)
         
-        if distribution == 'zinb':
+        if distribution == 'zinb': 
             self.decoder_dropout = nn.Sequential(
                 nn.Linear(hidden_dim // 2, n_output)
             )
@@ -174,25 +158,21 @@ class SpatialDomainModelGIB(BaseModuleClass):
         self.register_buffer("_X_raw", X_raw)
         return self
     
-    def set_epoch(self, epoch):
-        """🔥 NEW: 设置当前 epoch（用于判断是否在 warmup 期）"""
-        self.current_epoch = torch.tensor(epoch, dtype=torch.long, device=self.current_epoch.device)
+    def encode_with_gcn(self, h_base, edge_index, edge_weight):
+        """使用 GCN 编码"""
+        h = h_base
+        
+        for i, (gcn, bn) in enumerate(zip(self.gcn_layers, self.batch_norms)):
+            h = gcn(h, edge_index, edge_weight)
+            h = bn(h)
+            h = F.relu(h)
+            h = self.dropout(h)
+        
+        z = self.to_latent(h)
+        return z
     
     def forward_all(self):
-        """
-        完整前向传播（STAGUE 两步走）
-        
-        🔥 流程：
-        1.第一步：在原始图上编码 → Anchor 语义特征
-        2.第二步：用 Anchor 语义特征指导 GIB 剪枝 → Learner 图
-        3.第三步：在 Learner 图上二次编码 → Learner latent
-        
-        Returns:
-            z_anchor: anchor view 的 latent
-            z_learner: learner view 的 latent
-            decoder_outputs: anchor 的解码器输出
-            info: 统计信息
-        """
+        """完整前向传播"""
         X_pca = self._X_pca
         N = X_pca.size(0)
         device = X_pca.device
@@ -200,74 +180,40 @@ class SpatialDomainModelGIB(BaseModuleClass):
         library_size = self._X_raw.sum(dim=1, keepdim=True)
         info = {}
         
-        # 🔥 判断是否在 GIB warmup 期
-        in_gib_warmup = self.current_epoch < self.gib_warmup_epochs
+        # Step 2: 基础特征投影
+        h_base = self.shared_encoder(X_pca)
         
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 🔥 第一步：在原始图上编码（Anchor View）
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 1.构建原始图的稠密邻接矩阵
-        A_anchor = torch.zeros((N, N), device=device)
-        A_anchor[self._spatial_edge_index[0], self._spatial_edge_index[1]] = self._spatial_edge_weight
+        # Step 3: Attention-GIB 剪枝
+        pruned_edge_index, pruned_edge_weight, attention_probs, gib_loss = self.attention_gib(
+            h_base,
+            self._spatial_edge_index,
+            self._spatial_edge_weight
+        )
         
-        # 2.输入投影
-        h = self.input_proj(X_pca)  # [N, hidden_dim]
+        info['gib_keep_rate'] = (attention_probs > 0.5).float().mean().item()
+        info['gib_avg_prob'] = attention_probs.mean().item()
+        info['gib_loss'] = gib_loss.item()
+        info['_gib_loss_tensor'] = gib_loss
         
-        # 3.在原始图上编码，得到 Anchor 语义特征
-        h_anchor = self.gnn_encoder(h, A_anchor)  # [N, hidden_dim]
+        # Step 4: 双视图 GCN 编码
+        # 视图 1: 结构视图 (原始空间图)
+        z_spatial = self.encode_with_gcn(
+            h_base,
+            self._spatial_edge_index,
+            self._spatial_edge_weight
+        )
         
-        # 4.投影到 Latent
-        z_anchor = self.to_latent(h_anchor)  # [N, latent_dim]
+        # 视图 2: 特征视图 (剪枝后的图)
+        z_pruned = self.encode_with_gcn(
+            h_base,
+            pruned_edge_index,
+            pruned_edge_weight
+        )
         
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 🔥 第二步：用 Anchor 语义特征指导 GIB 剪枝
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if in_gib_warmup: 
-            # Warmup 期：直接使用原始图（不剪枝）
-            aug_edge_index = self._spatial_edge_index
-            aug_edge_weight = self._spatial_edge_weight
-            keep_probs = torch.ones(self._spatial_edge_index.size(1), device=device)
-            sparsity_loss = torch.tensor(0.0, device=device)
-            
-            info['gib_keep_rate'] = 1.0
-            info['gib_avg_prob'] = 1.0
-            info['gib_sparsity_loss'] = 0.0
-            info['in_gib_warmup'] = True
-        else:
-            # 正式训练期：使用 GIB 剪枝
-            aug_edge_index, aug_edge_weight, keep_probs, sparsity_loss = self.gib_pruner(
-                h_anchor,  # 🔥 输入是 Anchor 语义特征（不是原始 PCA）
-                self._spatial_edge_index,
-                self._spatial_edge_weight
-            )
-            
-            info['gib_keep_rate'] = (keep_probs > 0.5).float().mean().item()
-            info['gib_avg_prob'] = keep_probs.mean().item()
-            info['gib_sparsity_loss'] = sparsity_loss.item()
-            info['in_gib_warmup'] = False
+        # 解码
+        decoder_outputs = self._decode(z_spatial, library_size)
         
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 🔥 第三步：在 Learner 图上二次编码
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 1.构建 Learner 图的稠密邻接矩阵
-        A_learner = torch.zeros((N, N), device=device)
-        A_learner[aug_edge_index[0], aug_edge_index[1]] = aug_edge_weight
-        
-        # 2.在 Learner 图上编码（使用原始投影特征 h）
-        h_learner = self.gnn_encoder(h, A_learner)  # [N, hidden_dim]
-        
-        # 3.投影到 Latent
-        z_learner = self.to_latent(h_learner)  # [N, latent_dim]
-        
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 🔥 解码（仅 Anchor）
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        decoder_outputs = self._decode(z_anchor, library_size)
-        
-        # 传递 sparsity_loss
-        info['_gib_sparsity_loss_tensor'] = sparsity_loss
-        
-        return z_anchor, z_learner, decoder_outputs, info
+        return z_spatial, z_pruned, decoder_outputs, info
     
     def _decode(self, z, library_size):
         """解码器"""
@@ -285,7 +231,7 @@ class SpatialDomainModelGIB(BaseModuleClass):
         return outputs
     
     def compute_reconstruction_loss(self, decoder_outputs, x_raw):
-        """重构损失（仅 Anchor）"""
+        """重构损失"""
         px_rate = decoder_outputs['px_rate']
         eps = 1e-8
         px_rate = torch.clamp(px_rate, min=eps)
@@ -301,26 +247,20 @@ class SpatialDomainModelGIB(BaseModuleClass):
             from scvi.distributions import NegativeBinomial
             dist = NegativeBinomial(mu=px_rate, theta=px_r)
             recon_loss = -dist.log_prob(x_raw).sum(dim=-1)
+        elif self.reconstruction_loss == 'mse':
+            recon_loss = F.mse_loss(px_rate, x_raw, reduction='none').sum(dim=-1)
         else:
-            raise ValueError(f"Unsupported loss: {self.reconstruction_loss}")
+            raise ValueError(f"Unsupported loss:  {self.reconstruction_loss}")
         
         return recon_loss
     
-    def compute_contrastive_loss(self, z_anchor, z_learner):
+    def compute_contrastive_loss(self, z_spatial, z_pruned):
         """对比学习损失"""
-        return self.contrastive_loss_fn(z_anchor, z_learner)
-    
-    def compute_prototype_loss(self, z_latent):
-        """原型损失"""
-        z_proto = self.latent_to_prototype(z_latent)
-        Q, labels = self.prototypes(z_proto, update=True)
-        prototypes = self.prototypes.prototypes
-        loss, loss_dict = self.prototype_loss_fn(z_proto, prototypes, Q, labels)
-        return loss, loss_dict, Q
+        return self.contrastive_loss_fn(z_spatial, z_pruned)
     
     @torch.no_grad()
     def get_latent_representation(self):
-        """获取 latent（使用 anchor view）"""
+        """获取 latent 表示"""
         self.eval()
-        z_anchor, _, _, _ = self.forward_all()
-        return z_anchor.cpu().numpy()
+        z_spatial, _, _, _ = self.forward_all()
+        return z_spatial.cpu().numpy()

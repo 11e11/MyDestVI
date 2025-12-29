@@ -1,131 +1,198 @@
-"""GIB (Graph Information Bottleneck) 剪枝模块 - 语义感知版（STAGUE 模式）"""
+"""基于 Attention 的 GIB 剪枝模块（修复版：断开数值联系 + Entropy Loss）"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class GIBPruner(nn.Module):
+
+class AttentionGIBPruner(nn.Module):
     """
-    语义感知的 GIB 剪枝器
+    Attention-GIB 剪枝器（修复版）
     
     🔥 核心改进：
-    - 输入改为编码后的语义特征（不再是原始 PCA）
-    - 计算语义距离（不再是物理特征距离）
-    - 更准确地识别跨层边界
+    1.断开 pruned_edge_weight 和 attention_probs 的数值联系
+       - Prob 只决定边的存亡（0或1），不影响边的权重强度
+    2.引入 Entropy Loss 促进二元决策
+       - 避免模型停留在 0.5 左右"混日子"
     """
     
     def __init__(
         self,
-        node_dim: int,  # 语义特征维度（hidden_dim）
-        hidden_dim: int = 64,
-        min_keep_rate: float = 0.05,
-        max_keep_rate: float = 0.8,
-        temperature: float = 0.3,
-        use_soft_mask: bool = True
+        node_dim: int,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        temperature: float = 1.0,
+        use_gumbel: bool = True,
+        gumbel_tau: float = 0.5,
+        entropy_weight: float = 0.01  # 🔥 NEW: Entropy Loss 权重
     ):
         super().__init__()
         
-        self.min_keep_rate = min_keep_rate
-        self.max_keep_rate = max_keep_rate
+        self.node_dim = node_dim
+        self.num_heads = num_heads
+        self.head_dim = node_dim // num_heads
         self.temperature = temperature
-        self.use_soft_mask = use_soft_mask
+        self.use_gumbel = use_gumbel
+        self.gumbel_tau = gumbel_tau
+        self.entropy_weight = entropy_weight
         
-        # 🔥 边特征提取器（输入是语义特征）
-        self.edge_scorer = nn.Sequential(
-            nn.Linear(node_dim * 2 + node_dim + 1, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.05),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
+        assert node_dim % num_heads == 0, "node_dim 必须能被 num_heads 整除"
         
-        # 🔥 初始化偏置为 +3.0（确保训练开始时保留大部分边）
-        nn.init.constant_(self.edge_scorer[-1].bias, 3.0)
+        # Query 和 Key 投影
+        self.W_Q = nn.Linear(node_dim, node_dim, bias=False)
+        self.W_K = nn.Linear(node_dim, node_dim, bias=False)
         
-        print(f"🔥 GIB Pruner (语义感知版 - STAGUE):")
-        print(f"  - Input:  Semantic Features (from Encoder)")
-        print(f"  - Init Bias: +3.0 -> P(keep) ≈ 0.95")
-        print(f"  - Max Keep Rate: {max_keep_rate} (软约束)")
-        print(f"  - Use Soft Mask: {use_soft_mask}")
-
-    def compute_edge_features(self, h_semantic, edge_index):
+        self.dropout = nn.Dropout(dropout)
+        
+        print(f"🔥 Attention-GIB 剪枝器 (修复版):")
+        print(f"  - 输入维度: {node_dim}")
+        print(f"  - 注意力头数: {num_heads}")
+        print(f"  - Temperature: {temperature}")
+        print(f"  - 使用 Gumbel:  {use_gumbel}")
+        print(f"  - Entropy Weight: {entropy_weight}")
+        print(f"  - 🔥 边权重与 Prob 解耦")
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重"""
+        nn.init.xavier_uniform_(self.W_Q.weight)
+        nn.init.xavier_uniform_(self.W_K.weight)
+    
+    def compute_attention_scores(self, h_base, edge_index):
         """
-        计算边特征（基于语义特征）
+        计算边的 Attention 分数
         
-        Args:
-            h_semantic: [N, hidden_dim] 语义特征（来自 Encoder）
+        Args: 
+            h_base: [N, node_dim] 基础特征
             edge_index: [2, E] 边索引
+        
+        Returns:
+            attention_probs: [E] 每条边的保留概率
         """
+        N = h_base.size(0)
+        
+        # Query 和 Key
+        Q = self.W_Q(h_base).view(N, self.num_heads, self.head_dim)
+        K = self.W_K(h_base).view(N, self.num_heads, self.head_dim)
+        
         src, dst = edge_index[0], edge_index[1]
-        h_src, h_dst = h_semantic[src], h_semantic[dst]
         
-        # 1.拼接语义特征
-        edge_feats_concat = torch.cat([h_src, h_dst], dim=-1)
+        # 计算边的 Attention 分数
+        Q_src = Q[src]
+        K_dst = K[dst]
         
-        # 2.语义差异（L1）
-        edge_feats_diff = torch.abs(h_src - h_dst)
+        # Scaled Dot-Product Attention
+        scores = (Q_src * K_dst).sum(dim=-1) / (self.head_dim ** 0.5) + 2.0
+        scores = scores.mean(dim=-1)  # 多头平均
         
-        # 3.语义相似度（余弦）
-        cos_sim = F.cosine_similarity(h_src, h_dst, dim=-1).unsqueeze(-1)
+        # 缩放到 [0, 1]
+        attention_probs = torch.sigmoid(scores / self.temperature)
         
-        return torch.cat([edge_feats_concat, edge_feats_diff, cos_sim], dim=-1)
+        return attention_probs
     
-    def compute_edge_scores(self, h_semantic, edge_index):
-        """计算边的保留概率"""
-        edge_feats = self.compute_edge_features(h_semantic, edge_index)
-        logits = self.edge_scorer(edge_feats).squeeze(-1)
-        
-        # Sigmoid + 缩放到 [min_keep_rate, 1.0]
-        keep_probs = torch.sigmoid(logits / self.temperature)
-        keep_probs = self.min_keep_rate + (1.0 - self.min_keep_rate) * keep_probs
-        
-        return keep_probs, logits
-    
-    def forward(self, h_semantic, spatial_edge_index, spatial_edge_weight=None):
+    def straight_through_estimator(self, probs, hard:  bool = True):
         """
-        前向传播（语义感知版）
+        STE (Straight-Through Estimator) 离散化
+        
+        Args: 
+            probs: [E] 概率值
+            hard: 是否使用硬阈值
+        
+        Returns: 
+            mask: [E] 离散化的 mask (0 或 1)
+        """
+        if not self.training or not hard:
+            # 推理时：直接硬截断
+            return (probs > 0.5).float()
+        
+        if self.use_gumbel:
+            # 训练时：Gumbel-Softmax 采样
+            logits = torch.stack([
+                torch.log(probs + 1e-8),
+                torch.log(1 - probs + 1e-8)
+            ], dim=-1)
+            
+            # Gumbel-Softmax
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+            logits_with_noise = (logits + gumbel_noise) / self.gumbel_tau
+            
+            soft_mask = F.softmax(logits_with_noise, dim=-1)[:, 0]
+            
+            # Straight-Through
+            hard_mask = (soft_mask > 0.5).float()
+            mask = hard_mask - soft_mask.detach() + soft_mask
+        else:
+            # 简单的硬阈值 + STE
+            hard_mask = (probs > 0.5).float()
+            mask = hard_mask - probs.detach() + probs
+        
+        return mask
+    
+    def compute_entropy_loss(self, probs):
+        """
+        🔥 计算 Entropy Loss
+        
+        目标：鼓励 probs 趋向 0 或 1，避免停留在 0.5
         
         Args:
-            h_semantic: [N, hidden_dim] 语义特征（来自 Anchor 编码器）
+            probs: [E] 概率值
+        
+        Returns: 
+            entropy_loss: scalar
+        """
+        # Binary Entropy:  H(p) = -p*log(p) - (1-p)*log(1-p)
+        # 当 p=0 或 p=1 时，H(p)=0（确定性最大）
+        # 当 p=0.5 时，H(p)=1（不确定性最大）
+        eps = 1e-8
+        entropy = -(probs * torch.log(probs + eps) + (1 - probs) * torch.log(1 - probs + eps))
+        
+        # 我们希望最小化 entropy（即鼓励确定性决策）
+        return entropy.mean()
+    
+    def forward(self, h_base, spatial_edge_index, spatial_edge_weight=None):
+        """
+        前向传播
+        
+        Args:
+            h_base: [N, node_dim] 基础特征
             spatial_edge_index: [2, E] 原始空间图的边索引
             spatial_edge_weight: [E] 原始边权重
         
-        Returns:
-            aug_edge_index: 剪枝后的边索引
-            aug_edge_weight:  剪枝后的边权重
-            keep_probs: 保留概率
-            sparsity_loss: 稀疏性损失
+        Returns: 
+            pruned_edge_index: 剪枝后的边索引
+            pruned_edge_weight: 剪枝后的边权重
+            attention_probs: [E] Attention 概率
+            total_loss: 总的正则化损失（sparsity + entropy）
         """
-        keep_probs, _ = self.compute_edge_scores(h_semantic, spatial_edge_index)
-        num_edges = keep_probs.size(0)
+        # 1.计算 Attention 分数
+        attention_probs = self.compute_attention_scores(h_base, spatial_edge_index)
         
-        # 1.训练时：软权重（不采样）
-        if self.training and self.use_soft_mask:
-            keep_mask = keep_probs > self.min_keep_rate
-        else:
-            # 推理时：硬截断
-            keep_mask = keep_probs > 0.5
-        
-        # 2.自适应 Top-K 截断（软约束）
-        if self.max_keep_rate < 1.0:
-            actual_keep_rate = keep_mask.float().mean().item()
-            
-            if actual_keep_rate > self.max_keep_rate:
-                k = int(num_edges * self.max_keep_rate)
-                threshold = torch.kthvalue(keep_probs, num_edges - k + 1).values
-                keep_mask = keep_mask & (keep_probs >= threshold)
+        # 2.STE 离散化
+        mask = self.straight_through_estimator(attention_probs, hard=True)
         
         # 3.应用 mask
-        aug_edge_index = spatial_edge_index[: , keep_mask]
+        keep_indices = mask > 0.5
+        pruned_edge_index = spatial_edge_index[: , keep_indices]
         
-        # 4.边权重 = 原始权重 × 保留概率
+        # 🔥 关键修改：边权重不再乘以 attention_probs
+        # Prob 只决定边的存亡，不影响权重强度
         if spatial_edge_weight is not None:
-            aug_edge_weight = spatial_edge_weight[keep_mask] * keep_probs[keep_mask]
-        else: 
-            aug_edge_weight = keep_probs[keep_mask]
+            pruned_edge_weight = spatial_edge_weight[keep_indices]  # ✅ 保持原始权重
+        else:
+            pruned_edge_weight = torch.ones(keep_indices.sum(), device=h_base.device)
         
-        # 5.稀疏性损失（L1 正则）
-        sparsity_loss = keep_probs.mean()
+        # 4.稀疏性损失（L1 正则，鼓励剪枝）
+        sparsity_loss = attention_probs.mean()
         
-        return aug_edge_index, aug_edge_weight, keep_probs, sparsity_loss
+        # 5.🔥 Entropy Loss（鼓励二元决策）
+        entropy_loss = self.compute_entropy_loss(attention_probs)
+        
+        # 总损失
+        total_loss = sparsity_loss + self.entropy_weight * entropy_loss
+        
+        return pruned_edge_index, pruned_edge_weight, attention_probs, total_loss
+    
+    def get_edge_importance(self, h_base, spatial_edge_index):
+        """获取边的重要性分数（用于可视化）"""
+        with torch.no_grad():
+            return self.compute_attention_scores(h_base, spatial_edge_index)
