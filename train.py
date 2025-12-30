@@ -547,8 +547,8 @@ def main(args):
         latent_dim=args.latent_dim,
         gib_num_heads=args.gib_num_heads,
         gib_temperature=args.gib_temperature,
-        gib_use_gumbel=args.gib_use_gumbel,
-        gib_gumbel_tau=args.gib_gumbel_tau,
+        # gib_use_gumbel=args.gib_use_gumbel,
+        # gib_gumbel_tau=args.gib_gumbel_tau,
         gib_entropy_weight=args.gib_entropy_weight,  # 🔥 NEW
         contrastive_temperature=args.contrastive_temp,
         contrastive_weight=args.contrastive_weight,
@@ -622,7 +622,9 @@ def main(args):
             log(f"  Contrastive Loss:        {metrics['contrastive_loss']:.4f}")
             log(f"  GIB Loss:                {metrics['gib_loss']:.4f}")
             log(f"  GIB Keep Rate:           {metrics['gib_keep_rate']:.3f}")
-            log(f"  GIB Avg Prob:            {metrics['gib_avg_prob']:.3f}")
+            log(f"  GIB Effective Sparsity:  {metrics. get('gib_effective_sparsity', 'N/A'):.3f}")
+            log(f"  GIB Max Weight:            {metrics['gib_max_prob']:.3f}")
+            log(f"  GIB Min Weight:            {metrics['gib_min_prob']:.3f}")
             
             if 'px_r_mean' in metrics:
                 log(f"  Dispersion (θ):          {metrics['px_r_mean']:.3f} ± {metrics['px_r_std']:.3f}")
@@ -987,10 +989,10 @@ if __name__ == "__main__":
     
     # Attention-GIB 参数
     parser.add_argument('--gib_num_heads', type=int, default=4)
-    parser.add_argument('--gib_temperature', type=float, default=1.0)
-    parser.add_argument('--gib_use_gumbel', action='store_true', default=True)
-    parser.add_argument('--gib_gumbel_tau', type=float, default=0.5)
-    parser.add_argument('--gib_entropy_weight', type=float, default=0.01)  # 🔥 NEW
+    parser.add_argument('--gib_temperature', type=float, default=0.5)
+    # parser.add_argument('--gib_use_gumbel', action='store_true', default=True)
+    # parser.add_argument('--gib_gumbel_tau', type=float, default=0.5)
+    parser.add_argument('--gib_entropy_weight', type=float, default=0.1)  # 🔥 NEW
     
     # 损失权重
     parser.add_argument('--contrastive_weight', type=float, default=1.0)

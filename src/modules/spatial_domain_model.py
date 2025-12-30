@@ -74,12 +74,13 @@ class SpatialDomainModel(nn.Module):
         
         # Step 3: Attention-GIB 剪枝模块
         self.attention_gib = AttentionGIBPruner(
-            node_dim=hidden_dim,
+            input_dim=n_input,
+            hidden_dim=64,
             num_heads=gib_num_heads,
             dropout=dropout,
             temperature=gib_temperature,
-            use_gumbel=gib_use_gumbel,
-            gumbel_tau=gib_gumbel_tau,
+            # use_gumbel=gib_use_gumbel,
+            # gumbel_tau=gib_gumbel_tau,
             entropy_weight=gib_entropy_weight  # 🔥 NEW
         )
         
@@ -185,15 +186,21 @@ class SpatialDomainModel(nn.Module):
         
         # Step 3: Attention-GIB 剪枝
         pruned_edge_index, pruned_edge_weight, attention_probs, gib_loss = self.attention_gib(
-            h_base,
+            X_pca,
             self._spatial_edge_index,
             self._spatial_edge_weight
         )
         
-        info['gib_keep_rate'] = (attention_probs > 0.5).float().mean().item()
-        info['gib_avg_prob'] = attention_probs.mean().item()
+        info['gib_keep_rate'] = (attention_probs > 0.05).float().mean().item()
+        info['gib_max_prob'] = attention_probs.max().item()
+        info['gib_min_prob'] = attention_probs.min().item()
         info['gib_loss'] = gib_loss.item()
         info['_gib_loss_tensor'] = gib_loss
+        # 在 info 字典中添加
+        info['gib_effective_sparsity'] = self.attention_gib.get_effective_sparsity(
+            attention_probs, 
+            threshold=0.05  # 权重 < 0.05 视为"被剪枝"
+        )
         
         # Step 4: 双视图 GCN 编码
         # 视图 1: 结构视图 (原始空间图)
